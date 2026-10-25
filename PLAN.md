@@ -19,6 +19,18 @@ make -j10         # runtime + game library (about 2-3 min the first time)
 ./build/dreadrecomp .
 ```
 
+Controls: any SDL gamepad (Nintendo layout by position: right face button = A, bottom = B, top = X, left = Y; L/R
+shoulders, ZL/ZR triggers; Dread: B jump, Y shoot, R missiles, L free aim, ZL/ZR ability buttons) or the keyboard:
+WASD left stick, arrow keys d-pad, K/J/L/I = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter / Backspace = Plus / Minus,
+F / keypad 0 = stick clicks, keypad 8/5/4/6 right stick. Remappable in `dreadrecomp.ini` (`bind_key_*` / `bind_pad_*`
+lines); F11 toggles fullscreen. Unrecognised controllers: add an SDL mapping line to `gamecontrollerdb.txt`.
+
+Whole-game check: `tools/checkpoints.sh <dir> [jobs] [first] [last]` boots each folder of a save-file ladder (folders
+holding `profile0/*.bmssv`, e.g. the 54 1.0.0 checkpoints of github.com/ZacharyACoon/MetroidDreadSaveFiles, cloned
+into the ignored build/ - player data, never committed) from a scratch copy, continues it, walks left and right and
+captures frames into build/cp/<NNN>/; `tools/checkpoint_sheet.sh <dir>` puts each next to its hardware screenshot.
+`LARECOMP_VPAD` drives a virtual SDL gamepad (the real controller path) in tests.
+
 Test hooks inherited from LASRecomp: `LARECOMP_INPUT="frame:A:frames,..."` (scripted pad),
 `LARECOMP_SHOT_AT=frame,...` (build/frames/), `LARECOMP_DEBUG_FRAME=n` (per-draw log and per-pass images),
 `LARECOMP_SAVE_MSL=1` (translated shaders to build/msl/), `LARECOMP_NO_AUDIO=1`.

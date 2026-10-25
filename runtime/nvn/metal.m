@@ -1457,13 +1457,19 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     if (b && b->tex) {  // LARECOMP_SHOT_AT=<frame>,<frame>,... (ascending): the game image at those frames -> build/frames/frame_N.png
         static const char *next;
         static int init;
-        if (!init) { init = 1; next = getenv("LARECOMP_SHOT_AT"); if (next) mkdir("build/frames", 0755); }
+        static const char *dir = "build/frames";  // (LARECOMP_FRAMES_DIR: elsewhere - parallel test runs)
+        if (!init) {
+            init = 1;
+            next = getenv("LARECOMP_SHOT_AT");
+            if (getenv("LARECOMP_FRAMES_DIR")) dir = getenv("LARECOMP_FRAMES_DIR");
+            if (next) mkdir(dir, 0755);
+        }
         while (next && *next) {
             long at = strtol(next, (char **)&next, 10);
             if ((long)frame < at) { while (next > getenv("LARECOMP_SHOT_AT") && next[-1] != ',') next--; break; }
             if ((long)frame == at) {
-                char path[256];
-                snprintf(path, sizeof path, "build/frames/frame_%05llu.png", (unsigned long long)frame);
+                char path[1100];
+                snprintf(path, sizeof path, "%s/frame_%05llu.png", dir, (unsigned long long)frame);
                 save_png(b->tex, path);
             }
             if (*next == ',') next++;
