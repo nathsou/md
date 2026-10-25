@@ -29,6 +29,13 @@ def sext26(w):
     return v - 0x04000000 if v & 0x02000000 else v
 
 
+def setjmp_call(a):
+    """A guest setjmp call, as a host _setjmp in this function's frame (runtime/hle/setjmp.c): 0 now, and again the
+    longjmp's value when one comes back here (setjmp.c restored the guest registers and x0 by then)."""
+    return (f'c->x[30] = {hx(a + 4)}; {{ uint64_t jb_ = c->x[0]; if (!_setjmp(*(jmp_buf *)rt_setjmp_slot(c, jb_))) '
+            f'{{ rt_setjmp_save(c, jb_); c->x[0] = 0; }} }}  /* setjmp */')
+
+
 def fname(a):
     return f'f_{a:x}'
 
@@ -50,6 +57,36 @@ class Module:
         self.cache = {}
         self.stats = Counter()
         self.mu = None
+        self.setjmp = self.setjmp_targets()
+
+    def plt_names(self):
+        """{PLT stub address: imported symbol name}: stubs are `adrp x16, page; ldr x17, [x16, #off]; add x16, x16,
+        #off; br x17`, and the GOT slot they load has a JUMP_SLOT relocation naming the symbol."""
+        n = self.nso
+        slot = {off: n.syms[sym][0] for off, typ, sym, add in n.relocs if typ == 1026 and sym < len(n.syms)}
+        out = {}
+        w = self.words
+        for i in range(len(w) - 3):
+            if (w[i] & 0x9F00001F) != 0x90000010 or (w[i + 1] & 0xFFC003FF) != 0xF9400211 or w[i + 3] != 0xD61F0220:
+                continue
+            imm = ((w[i] >> 5) & 0x7FFFF) << 2 | ((w[i] >> 29) & 3)
+            if imm & (1 << 20):
+                imm -= 1 << 21
+            pc = self.lo + i * 4
+            got = (pc & ~0xFFF) + (imm << 12) + ((w[i + 1] >> 10) & 0xFFF) * 8
+            name = slot.get(got - self.base)
+            if name:
+                out[pc] = name
+        return out
+
+    def setjmp_targets(self):
+        """Addresses a `bl` reaches setjmp through: the module's own setjmp symbols and its PLT stubs for them."""
+        names = {'setjmp', '_setjmp', '__setjmp'}
+        t = {a for a, nm in self.plt_names().items() if nm in names}
+        for name, info, shndx, value, size in self.nso.syms:
+            if shndx and name in names:
+                t.add(self.base + value)
+        return t
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -340,6 +377,8 @@ class Module:
             return [f'if ({ins.cond}) {{ {jump(ins.target)} }}']
         if k == 'bl':
             t = ins.target
+            if t in self.setjmp:
+                return [setjmp_call(a)]
             if self.in_text(t):
                 refs.add(t)
                 return [f'c->x[30] = {hx(a + 4)}; {fname(t)}(c);']
@@ -450,6 +489,8 @@ class Module:
                 out.append('    ' + jump(ins.target))
             elif k == 'bcond':
                 out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+            elif k == 'bl' and ins.target in self.setjmp:
+                out.append('    ' + setjmp_call(a))
             elif k == 'bl':
                 t = ins.target
                 if self.in_text(t):
@@ -599,7 +640,7 @@ def main():
         end = order[i + 1] if i + 1 < len(order) else m.hi
         labels, ext, tables = scanned[(a, end)]
         entries[a] = (end, labels, tables)
-    print(f'{args.name}: {len(fde)} eh_frame ranges, ' + f'{len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
+    print(f'{args.name}: {len(m.setjmp)} setjmp targets, {len(fde)} eh_frame ranges, ' + f'{len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
 
     os.makedirs(args.outdir, exist_ok=True)

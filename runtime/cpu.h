@@ -29,6 +29,11 @@ _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
 
+// ---- setjmp across recompiled code (runtime/hle/setjmp.c): tools/gen.py emits a host _setjmp at each guest setjmp call
+#include <setjmp.h>
+void *rt_setjmp_slot(Cpu *c, uint64_t guest_jmp_buf);  // (a jmp_buf *)
+void rt_setjmp_save(Cpu *c, uint64_t guest_jmp_buf);
+
 // ---- runtime services (runtime/*.c)
 void rt_dispatch(Cpu *c);                 // call function at c->pc
 // hook site (tools/patches.py HOOKS, runtime/hle/hooks.c): 0 = run the instruction, 1 = the hook did it all,

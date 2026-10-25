@@ -729,6 +729,49 @@ static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
+// Input recordings: LARECOMP_RECORD=<file> writes player 1's state every time it changes, as lines
+// "<presented frame> <buttons, hex: A B X Y LS RS L R ZL ZR + - left up right down> <lx> <ly> <rx> <ry>" (sticks
+// -32767..32767, as yuzu's TAS scripts order them); LARECOMP_REPLAY=<file> plays one back instead of the controls.
+// Frames count from boot, so a replay holds in step only as long as the game's loads take as long as when it was
+// recorded: record short segments, each from a save (tools/checkpoints.sh).
+typedef struct { uint64_t frame, b; int32_t lx, ly, rx, ry; } RecStep;
+static void record_replay(uint64_t *b, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    extern uint64_t renderer_present_count(void);
+    static int init;
+    static FILE *rec;
+    static RecStep *steps, last = {~0ull, 0, 0, 0, 0, 0};
+    static size_t nsteps, cur;
+    if (!init) {
+        init = 1;
+        const char *r = getenv("LARECOMP_RECORD"), *p = getenv("LARECOMP_REPLAY");
+        if (r && (rec = fopen(r, "w"))) LOG("[input] recording to %s\n", r);
+        FILE *f = p ? fopen(p, "r") : NULL;
+        if (f) {
+            size_t cap = 0;
+            RecStep st;
+            unsigned long long fr, bb;
+            while (fscanf(f, "%llu %llx %d %d %d %d", &fr, &bb, &st.lx, &st.ly, &st.rx, &st.ry) == 6) {
+                st.frame = fr, st.b = bb;
+                if (nsteps == cap) steps = realloc(steps, (cap = cap ? cap * 2 : 1024) * sizeof *steps);
+                steps[nsteps++] = st;
+            }
+            fclose(f);
+            LOG("[input] replaying %s: %zu steps\n", p, nsteps);
+        }
+    }
+    uint64_t frame = renderer_present_count();
+    if (steps) {  // the latest step at or before this frame
+        while (cur + 1 < nsteps && steps[cur + 1].frame <= frame) cur++;
+        if (steps[cur].frame <= frame) *b = steps[cur].b, *lx = steps[cur].lx, *ly = steps[cur].ly, *rx = steps[cur].rx, *ry = steps[cur].ry;
+        else *b = 0, *lx = *ly = *rx = *ry = 0;
+    }
+    if (rec && (*b != last.b || *lx != last.lx || *ly != last.ly || *rx != last.rx || *ry != last.ry)) {
+        last = (RecStep){frame, *b, *lx, *ly, *rx, *ry};
+        fprintf(rec, "%llu %llx %d %d %d %d\n", (unsigned long long)frame, (unsigned long long)*b, *lx, *ly, *rx, *ry);
+        fflush(rec);
+    }
+}
+
 static void fill_state(Cpu *c) {
     uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[1];
@@ -794,6 +837,7 @@ static void fill_state(Cpu *c) {
             b &= ~(0xfull << 12);
         }
     }
+    record_replay(&b, &lx, &ly, &rx, &ry);
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;

@@ -8,3 +8,5 @@ strlen
 strcmp
 strncmp
 memchr
+longjmp
+_longjmp

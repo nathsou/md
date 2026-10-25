@@ -8,3 +8,8 @@ from game_addresses import ADDRESS as A  # noqa: F401 (for the patches to come)
 
 PATCHES = {}
 HOOKS = {}
+
+# Movie player request gates (runtime/hle/hooks.c): the game waits for its movie dispatcher to take each posted
+# link / unlink request, as the dispatcher's preemption makes it on the Switch (nxnative's "observation gates").
+HOOKS[A.MOVIE_LINK_GATE_SITE] = (0x910022d6, [], 'add x22, x22, #8 after the link request')
+HOOKS[A.MOVIE_UNLINK_GATE_SITE] = (0x910022d6, [], 'add x22, x22, #8 after the unlink request')
