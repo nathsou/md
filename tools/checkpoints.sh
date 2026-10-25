@@ -22,7 +22,7 @@ TIMEOUT=${TIMEOUT:-$((EXPLORE + 150))}
 if [ "$EXPLORE" -gt 0 ]; then
     INPUT=$(python3 - "$EXPLORE" <<'PY'
 import sys
-secs = int(sys.argv[1]); start = 7000; end = start + secs * 120  # (frames: ~120 presented a second)
+secs = int(sys.argv[1]); start = 7000; end = start + secs * 120  # (frames: ~120 presented a second on a 120 Hz display, 60 on a 60 Hz one)
 steps = [f"{f}:A:6" for f in (2500, 3000, 3400, 3800, 4200)]
 f, d = start, 0
 while f < end:

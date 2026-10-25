@@ -29,6 +29,8 @@ not an emulator: the game runs as a native program.
 
 - Boots, plays its movies, runs the title screen, save files and the whole opening, and is playable with a gamepad or
   the keyboard.
+- Runs at your display's refresh rate: 120 fps on a 120 Hz (ProMotion) Mac, at the right game speed (the game steps
+  its world by elapsed time; measured, see PLAN.md "Frame rate"). Cutscenes play at their own 30 fps.
 - Every one of the 832 unique shader stages the game ships translates to Metal and compiles (`make corpus`).
 - Checked against a ladder of 54 save files spanning the whole game (every area, from the opening to Raven Beak): each
   one loads and runs three minutes of scripted running, jumping and shooting without crashing, and renders correctly

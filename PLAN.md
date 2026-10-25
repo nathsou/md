@@ -64,7 +64,21 @@ Graphics fixes since (commits after the first snapshot):
   `system/shd`. All pass; the GLSL translation passes with `CORPUS_ARGS=--glsl`.
 
 Rendering now matches reference screenshots of the opening area (the Chozo statue room) and looks right in the
-first caves, at 60 fps (120 presents a second on a 120 Hz display).
+first caves, at the display's refresh rate (see "Frame rate" below).
+
+**Frame rate.** The game runs at whatever rate the display refreshes: 120 fps on a 120 Hz (ProMotion) Mac, 60 on a
+60 Hz display. Nothing caps it at 60: the game thread blocks only on untimed waits, and the only limit is Metal's
+`nextDrawable` (the display's refresh, even with `displaySyncEnabled` off, in a window). Measured on an M4 Pro, 120 Hz:
+- every present is a full world update: over 600 presented frames, 648 game functions ran exactly 600 times and none
+  ran 300 times (`LARECOMP_FNPROF=5000:5600`);
+- the world steps by elapsed time: Samus ran about 845 px/s at 120 fps and 833 px/s at ~68 fps
+  (`LARECOMP_SIM_SLOW_FRAME_MS=11`), holding left for the same 0.55-0.58 s from the same save. The same 60 frames of
+  input took her ~2.2x farther at ~68 fps (fixed steps would have given the same distance);
+- the 54-checkpoint exploration runs (3 minutes each) all ran at 120 fps;
+- cutscenes stay at 30 fps (paced by the movie's audio clock).
+The emulated 60 Hz vsync (`runtime/hle/vi.c`) doesn't pace the game: running it at 120 Hz changed nothing.
+`LARECOMP_INPUT`, `LARECOMP_SHOT_AT` and the checkpoint scripts count presented frames, so their timings assume
+~120 frames a second (on a 60 Hz display they take twice as long).
 
 Known problems, in priority order:
 1. **Audio:** the I3DL2 reverb effect (audio renderer effect type 5), which NintendoWare Atk uses, isn't implemented
@@ -269,7 +283,8 @@ Each phase has an exit test. The phases are rough, not dated; graphics will take
 - Version 2.1.0 (the latest update) through LASRecomp's version mapping (addresses mapped through identical
   functions).
 - Enhancements: resolution scaling, MetalFX/FSR, widescreen and ultrawide (a 2.5D camera, so check the culling
-  bounds), higher frame rates (needs a look at Dread's frame timing), and shaders prepared ahead of time.
+  bounds), and shaders prepared ahead of time. (Higher frame rates: already there, see "Frame rate"; an optional cap,
+  for example 60 on battery, isn't.)
 - Mods: romfs overlay (LayeredFS-style), code mods through hooks, and compatibility with community randomizer
   output.
 
