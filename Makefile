@@ -355,3 +355,12 @@ smoketest:
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c
+
+# Every shader the game ships (romfs/system/shd), translated and compiled with Metal: no game needed to run
+# (tools/shader_corpus.m). `make corpus` (MSL + Metal) - add CORPUS_ARGS=--glsl for the Vulkan GLSL translation.
+build/shader_corpus: tools/shader_corpus.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
+	@mkdir -p $(dir $@)
+	clang -O1 -fobjc-arc -framework Metal -framework Foundation -Iruntime/nvn/maxwell tools/shader_corpus.m runtime/nvn/maxwell/translate.c -o $@
+corpus: build/shader_corpus
+	build/shader_corpus $(GAME)/romfs/system/shd $(CORPUS_ARGS)
+.PHONY: corpus

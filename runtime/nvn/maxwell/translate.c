@@ -883,6 +883,65 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+
+// TXD: a texture lookup with explicit derivatives (yuzu's texture_gradient.cpp has the layout). Coordinates from
+// register A; the register after them holds the array index (low 16 bits) and the texel offset (signed 4-bit fields at
+// bits 16 and 20); the derivatives from register B, interleaved dx.u, dy.u, dx.v, dy.v. Dread's fragment shaders use the
+// 2D form.
+static void emit_txd(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int ttype = (int)bits(w, 28, 3);  // 0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D, 6 cube
+    bool aoffi = bits(w, 35, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    if (ttype != 0 && ttype != 1 && ttype != 2 && ttype != 3) { fail(c, "txd: 3d / cube"); return; }
+    bool array = ttype & 1;
+    int n = ttype < 2 ? 1 : 2;
+    int type = n == 1 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D) : (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D);
+    int slot = tex_slot(c, index, type, false, array);
+    int last = a + n;  // (array index / offsets)
+    for (int i = 0; i < n; i++) c->reg_used[a + i] = 1;
+    for (int i = 0; i < 2 * n; i++) c->reg_used[b + i] = 1;
+    if (array || aoffi) c->reg_used[last] = 1;
+    char call[2048], off[128] = "", lay[96] = "";
+    if (c->glsl) {
+        if (c->fail) return;
+        if (aoffi && n == 2) sprintf(off, ", ivec2(int(r%d << 12) >> 28, int(r%d << 8) >> 28)", last, last);
+        if (aoffi && n == 1) sprintf(off, ", int(r%d << 12) >> 28", last);
+        if (n == 1) {
+            char co[96];
+            if (array) sprintf(co, "vec2(as_type<float>(r%d), float(r%d & 0xFFFFu))", a, last);
+            else sprintf(co, "as_type<float>(r%d)", a);
+            sprintf(call, "textureGrad%s(t%d, %s, as_type<float>(r%d), as_type<float>(r%d)%s)", aoffi ? "Offset" : "", slot, co, b, b + 1, off);
+        } else {
+            char uv[256], co[320];
+            sprintf(uv, "uvs(vec2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d])", a, a + 1, slot + 1);
+            c->uses_rscale = true;
+            if (array) sprintf(co, "vec3(%s, float(r%d & 0xFFFFu))", uv, last);
+            else strcpy(co, uv);
+            sprintf(call, "textureGrad%s(t%d, %s, vec2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw, "
+                    "vec2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw%s)", aoffi ? "Offset" : "", slot, co,
+                    b, b + 2, slot + 1, b + 1, b + 3, slot + 1, off);
+        }
+        write_tex_result(c, slot, call, mask, d, RZ, false, false);
+        return;
+    }
+    if (array) sprintf(lay, ", r%d & 0xFFFFu", last);
+    if (n == 1) {
+        if (aoffi) sprintf(off, ", int(r%d << 12) >> 28", last);
+        // (Metal has no 1D gradients: 1D textures have a single level here, the derivative only picks it)
+        sprintf(call, "t%d.sample(s%d, as_type<float>(r%d)%s%s)", slot, slot, a, lay, off);
+    } else {
+        if (aoffi) sprintf(off, ", int2(int(r%d << 12) >> 28, int(r%d << 8) >> 28)", last, last);
+        c->uses_rscale = true;
+        sprintf(call, "t%d.sample(s%d, uvs(float2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d])%s, "
+                "gradient2d(float2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw, "
+                "float2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw)%s)", slot, slot, a, a + 1, slot + 1, lay,
+                b, b + 2, slot + 1, b + 1, b + 3, slot + 1, off);
+    }
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
 // ------------------------------------------------------------------ instruction translation
 // The game's light-culling compute shader (a 30x17 grid of 64-pixel tiles for the tiled lighting of interiors and
 // caves) turns a tile's pixel column into a view direction with the screen height alone: x = px * 2 / height -
@@ -973,8 +1032,37 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = 1 + (int)bits(w, 47, 2);
         uint32_t addr = (uint32_t)bits(w, 20, 10);
         int ia = (int)bits(w, 8, 8);
-        if (ia != RZ) { fail(c, "indexed ld a[]"); }
-        for (int i = 0; i < n; i++) attr_load(c, d + i, addr + 4 * i, NULL);
+        if (ia != RZ && c->stage == STAGE_VERTEX) {
+            // a[Rx + imm] (after AL2P): a vertex input chosen at run time - a select over the 16 generic attributes,
+            // each declared (unbound ones read the renderer's constant zero stream). Dread's draw-id shaders.
+            for (int i = 0; i < n; i++) {
+                char sel[8192], tmp[96];
+                int len = 0;
+                len += snprintf(sel + len, sizeof sel - len, "    { uint ad = r%d + %uu; r%d = ", ia, addr + 4 * i, d + i);
+                for (int at = 0; at < 16; at++)
+                    for (int comp = 0; comp < 4; comp++) {
+                        snprintf(tmp, sizeof tmp, "ad == %uu ? as_type<uint>(in.a%d[%d]) : ", 0x80 + 16 * at + 4 * comp, at, comp);
+                        len += snprintf(sel + len, sizeof sel - len, "%s", tmp);
+                    }
+                snprintf(sel + len, sizeof sel - len, "0u; }\n");
+                for (int at = 0; at < 16; at++) { c->in_attr_mask |= 1u << at; c->vs_in_comp[at] |= 0xF; }
+                c->reg_used[ia] = 1;
+                if (d + i != RZ) { c->reg_used[d + i] = 1; sp(&c->body, "%s", sel); }
+            }
+        } else {
+            if (ia != RZ) { fail(c, "indexed ld a[]"); }
+            for (int i = 0; i < n; i++) attr_load(c, d + i, addr + 4 * i, NULL);
+        }
+    } else if (OPM(0xefa0000000000000ull, 0xfff8000000000000ull)) {  // AL2P: attribute address, logical -> physical
+        // (Rd = Ra + imm11: the physical layout is the logical one here; the predicate output - in range - is true)
+        int ra = (int)bits(w, 8, 8), pd = (int)bits(w, 44, 3);
+        uint32_t imm = (uint32_t)bits(w, 20, 11);
+        if (d != RZ) {
+            c->reg_used[d] = 1;
+            if (ra != RZ) c->reg_used[ra] = 1;
+            sp(&c->body, "    r%d = %s + %uu;\n", d, ra == RZ ? "0u" : (sprintf(t, "r%d", ra), t), imm);
+        }
+        if (pd != PT) sp(&c->body, "    p%d = true;\n", pd);
     } else if (OPM(0xeff0000000000000ull, 0xfff8000000000000ull)) {  // ST attribute
         int n = 1 + (int)bits(w, 47, 2);
         uint32_t addr = (uint32_t)bits(w, 20, 10);
@@ -1007,6 +1095,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_texs(c, w, true);
     } else if (OPM(0xc038000000000000ull, 0xfc38000000000000ull)) {  // TEX
         emit_tex(c, w, false);
+    } else if (OPM(0xde38000000000000ull, 0xfffc000000000000ull)) {  // TXD
+        emit_txd(c, w);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
@@ -2252,7 +2342,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (size_t i = 0; i < n; i++) {
         uint64_t w = ((const uint64_t *)code)[i];
         if (i % 4 == 0) continue;
-        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;  // bra self
+        // bra self: to itself (-8), or, first in its group, to the group's scheduling word just before it (-16), which
+        // lands on the same branch (Dread's compiler pads with that form, then NOPs: without it the end ran on into
+        // the constants or the SASS text after the code)
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && end &&
+            (sbits(w, 20, 24) == -8 || (sbits(w, 20, 24) == -16 && i % 4 == 1))) break;
         if (w == 0 && i > 4) break;
         end = i + 1;
     }
