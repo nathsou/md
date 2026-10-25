@@ -20,7 +20,7 @@ make -j10         # runtime + game library (about 2-3 min the first time)
 ```
 
 Controls: any SDL gamepad (Nintendo layout by position: right face button = A, bottom = B, top = X, left = Y; L/R
-shoulders, ZL/ZR triggers; Dread: B jump, Y shoot, R missiles, L free aim, ZL/ZR ability buttons) or the keyboard:
+shoulders, ZL/ZR triggers; in Dread B jumps and Y shoots) or the keyboard:
 WASD left stick, arrow keys d-pad, K/J/L/I = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter / Backspace = Plus / Minus,
 F / keypad 0 = stick clicks, keypad 8/5/4/6 right stick. Remappable in `dreadrecomp.ini` (`bind_key_*` / `bind_pad_*`
 lines); F11 toggles fullscreen. Unrecognised controllers: add an SDL mapping line to `gamecontrollerdb.txt`.
