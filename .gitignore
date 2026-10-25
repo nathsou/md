@@ -1,0 +1,16 @@
+# Nintendo files: never commit (game dump, keys, extracted files, generated code)
+*.xci
+*.nsp
+*.keys
+exefs/
+romfs/
+generated/
+build/
+.venv/
+__pycache__/
+*.log
+# runtime data written next to the game files (dev mode): saves, shader caches, settings, logs
+save/
+cache/
+dreadrecomp.ini
+.DS_Store
