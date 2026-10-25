@@ -69,9 +69,12 @@ first caves, at 60 fps (120 presents a second on a 120 Hz display).
 Known problems, in priority order:
 1. **Audio:** the I3DL2 reverb effect (audio renderer effect type 5), which NintendoWare Atk uses, isn't implemented
    (only type 4 reverb is), and nothing has been checked by ear.
-2. **Graphics, unverified areas:** only the opening, its caves and the cutscenes have been looked at. EMMI zones,
-   other regions, the hologram videos (several at once) and boss fights haven't. Suit colours in dark caves look
-   bluish; this isn't confirmed against the real game.
+2. **Whole game, not a playthrough:** all 54 checkpoints of a 1.0.0 save ladder (every area, opening to Raven Beak)
+   load and run three minutes of scripted play without crashing and look right (the black rectangles outside the
+   current room are the game's own). That was after fixing `setjmp`/`longjmp` (Lua's error handling) and a
+   movie-player race (the dispatcher returned with an unlink pending). Boss fights, EMMI chases and cutscenes beyond
+   the opening are only covered where the scripted play happened to run into them, and nobody has finished the
+   game on it yet.
 3. Unhandled `am` commands (logged as ok), `ectx:aw` is a logging stub, and `nfp` (amiibo) is a stub.
 4. No menu or start screen yet (`runtime/ui/menu.mm` is a stub; F11 toggles fullscreen); the on-device game-code
    build (`runtime/gamebuild.c`) still knows only two modules.
