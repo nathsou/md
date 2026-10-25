@@ -693,12 +693,14 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x0B: {  // SleepThread (in slices of at most 50 ms: a reboot doesn't wait out a long sleep)
         int64_t ns = (int64_t)x[0];
         if (ns <= 0) { sched_yield(); break; }
+        t_cur->sleeping = true;
         for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
             uint64_t d = end - now < 50000000 ? end - now : 50000000;
             struct timespec ts = {(time_t)(d / 1000000000), (long)(d % 1000000000)};
             nanosleep(&ts, NULL);
             g_blocked_ns += plat_now_ns() - now;
         }
+        t_cur->sleeping = false;
         break;
     }
     case 0x0C: {  // GetThreadPriority(_, handle)
@@ -1069,4 +1071,25 @@ KSharedMem *kernel_create_shared_memory(uint64_t size, void (*on_map)(KSharedMem
     s->on_map = on_map;
     *handle = kernel_new_handle(&s->obj);
     return s;
+}
+
+// Same-core preemption, approximated where the game relies on it (runtime/hle/hooks.c). On the Switch a thread that
+// wakes a more urgent thread of its own core stops right there until that thread blocks again; here both run at once.
+// The caller waits until no more urgent thread of its core is runnable (in a wait, asleep, or not started), at most
+// max_ns. (nxnative's "core_preempt", for the same movie-player race.)
+void kernel_yield_to_urgent(uint64_t max_ns) {
+    KThread *me = t_cur;
+    if (!me) return;
+    uint64_t t0 = plat_now_ns();
+    for (;;) {
+        bool busy = false;
+        pthread_mutex_lock(&g_klock);
+        for (KThread *t = g_threads; t && !busy; t = t->anext)
+            if (t != me && t->started && !t->finished && t->core == me->core && t->prio < me->prio &&
+                t->wait_kind == WAIT_NONE && !t->in_sync_wait && !t->sleeping)
+                busy = true;
+        pthread_mutex_unlock(&g_klock);
+        if (!busy || plat_now_ns() - t0 > max_ns) return;
+        usleep(20);
+    }
 }

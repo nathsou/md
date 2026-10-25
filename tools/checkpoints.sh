@@ -44,7 +44,7 @@ fi
 
 run_one() {
     local dir="$1" n
-    n=$(basename "$dir" | cut -c1-3)
+    n=$(basename "$dir" | cut -d' ' -f1)  # ("NNN - name": NNN; a stress copy "NNNa": NNNa)
     local o="$OUT/$n"
     rm -rf "$o" && mkdir -p "$o/save/save_0"
     cp -R "$dir/profile0" "$o/save/save_0/"
@@ -62,8 +62,8 @@ i=0
 for dir in "$SRC"/*/; do
     dir=${dir%/}
     n=$(basename "$dir" | cut -c1-3)
-    [ "$((10#$n))" -lt "$FIRST" ] && continue
-    [ "$((10#$n))" -gt "$LAST" ] && continue
+    [ "$((10#$n))" -lt "$FIRST" ] && continue 2>/dev/null
+    [ "$((10#$n))" -gt "$LAST" ] && continue 2>/dev/null
     [ -d "$dir/profile0" ] || continue
     run_one "$dir" &
     i=$((i + 1))

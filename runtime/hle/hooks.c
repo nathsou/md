@@ -46,6 +46,10 @@ static void movie_ring_wait(uint64_t dispatcher) {
     volatile uint64_t *count = (volatile uint64_t *)(uintptr_t)(dispatcher + 0x370);
     uint64_t t0 = plat_now_ns();
     while (*count && plat_now_ns() - t0 < 200000000ull) usleep(50);
+    // ...and until the dispatcher (more urgent, same core) has finished with it and waits again: the ring count drops
+    // when it takes the request, before it is done (with only the count, about one load in five still crashed)
+    extern void kernel_yield_to_urgent(uint64_t max_ns);
+    kernel_yield_to_urgent(50000000ull);
 }
 
 int rt_hook(Cpu *c, uint64_t site) {
