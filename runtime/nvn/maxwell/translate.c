@@ -981,11 +981,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         for (int i = 0; i < n; i++) attr_store(c, d + i, addr + 4 * i);
     } else if (OPM(0xef90000000000000ull, 0xfff8000000000000ull)) {  // LD c[idx][reg + imm]
         int idx = (int)bits(w, 36, 5);
-        int64_t off = (int64_t)bits(w, 20, 16);  // unsigned (Ryujinx InstLdc.CbufOffset)
+        int64_t off = (int64_t)bits(w, 20, 16);
         int sz = (int)bits(w, 48, 3);
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // With an index register the offset is signed (yuzu: BitField<20, 16, s64>): Dread's bone / instance matrices
+        // load their rows as c[4][R + 0x10], c[4][R], c[4][R - 0x10]. Read as 0xfff0, the x row came from far past the
+        // buffer: static meshes' vertices flew sideways (full-width horizontal streaks) and foreground rock vanished.
+        if (dyn && off >= 0x8000) off -= 0x10000;
         // LDC.64 R4, c[i][R4 + x]: the address register is also a destination. Read it once before the writes, or
         // the second word comes from c[i][<first word> + x + 4] (fix from letsgo-recomp)
         bool overlap = dyn && n > 1 && a >= d && a < d + n;

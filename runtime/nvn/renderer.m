@@ -1545,20 +1545,11 @@ static void compile_program(Prog *pr) {
     NSError *err = nil;
     static MTLCompileOptions *vopts;
     static dispatch_once_t once;
-    // Vertex shaders: invariant positions, no fast math and no FP contraction. A depth prepass and the passes that test
-    // its depth EQUAL draw the same geometry with different vertex shaders; on the Switch each FMUL / FADD / FFMA the
-    // translator re-creates rounds on its own, so they agree to the bit. Fast math let Metal fuse and reorder that math
-    // differently per shader (Dread's G-buffer passes then failed EQUAL nearly everywhere: an almost black world).
-    dispatch_once(&once, ^{
-        vopts = [MTLCompileOptions new];
-        vopts.preserveInvariance = YES;
-        vopts.mathMode = MTLMathModeSafe;
-    });
+    dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
     double t0 = now_ms();
     // LARECOMP_SHADER_SALT=<text>: tag sources so Metal's disk cache misses (measure cold first-use compiles)
     NSString *salt = getenv("LARECOMP_SHADER_SALT") ? [NSString stringWithFormat:@"\n// %s\n", getenv("LARECOMP_SHADER_SALT")] : @"";
-    NSString *vsrc = [@"#pragma clang fp contract(off)\n" stringByAppendingString:[@(pr->vi->msl) stringByAppendingString:salt]];
-    id<MTLLibrary> vl = [dev newLibraryWithSource:vsrc options:vopts error:&err];
+    id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:vopts error:&err];
     if (!vl) { LOG("[shader] VS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->vi->msl); pr->failed = true; return; }
     id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:nil error:&err];
     if (!fl) { LOG("[shader] FS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->fi->msl); pr->failed = true; return; }
@@ -2901,6 +2892,11 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | fubo0:");
     for (int i = 0; i < 6; i++)
         if (st.ubuf[1][i].addr) { const float *f = (const float *)(uintptr_t)st.ubuf[1][i].addr; LOG(" f%d=[%g %g %g %g]", i, f[0], f[1], f[2], f[3]); }
+    if (st.ubuf[0][2].addr) {  // (the vertex stage's third buffer: per-draw material / UV transforms)
+        const float *f = (const float *)(uintptr_t)st.ubuf[0][2].addr;
+        LOG(" | vubo2:");
+        for (uint64_t i = 0; i < st.ubuf[0][2].size / 16 && i < 6; i++) LOG(" [%g %g %g %g]", f[4 * i], f[4 * i + 1], f[4 * i + 2], f[4 * i + 3]);
+    }
     LOG(" | ssbo:");
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < 16; i++)
@@ -3149,6 +3145,18 @@ static void draw(CmdRec *r, bool indexed) {
                 }
             }
             for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+            // LARECOMP_SKIP_FS=addr1,addr2,...: drop draws whose fragment shader code is at these addresses (the [draw]
+            // lines' fs=; find which program draws what)
+            static uint64_t skip_fs[16];
+            static int nskip_fs = -1;
+            if (nskip_fs < 0) {
+                nskip_fs = 0;
+                for (const char *p = getenv("LARECOMP_SKIP_FS"); p && *p && nskip_fs < 16;) {
+                    skip_fs[nskip_fs++] = strtoull(p, (char **)&p, 16);
+                    while (*p == ',') p++;
+                }
+            }
+            for (int i = 0; i < nskip_fs; i++) if (fs == skip_fs[i]) { stat_skipped++; return; }
             extern bool pot_level_active(void);
             if (last_hash == 0xa2177dbb72197bd9ull && pot_level_active()) { stat_skipped++; return; }  // item twinkle
         }
@@ -3280,14 +3288,12 @@ static void draw(CmdRec *r, bool indexed) {
     }
     bool decal_le = (hw_scale > 1 || hw_eps > 0) && (st.poly[3] & 4) && !nobias &&
                     (st.poly_offset[0] < 0 || st.poly_offset[1] < 0) && st.ds[0] && !st.ds[1] && st.ds[2] == 3;
-    // Depth EQUAL without writes after a depth prepass (Dread's G-buffer passes): the prepass and the shading pass draw
-    // the same geometry with different vertex shaders (e.g. rigid there, a skinning loop here). Maxwell's per-operation
-    // IEEE rounding gives them the same depth to the bit; the translated shaders under Metal's compiler don't (an almost
-    // black world). Tested as LEQUAL with a few units of bias toward the camera instead - the decal path below - which
-    // keeps rejecting hidden surfaces. LARECOMP_EXACT_EQUAL=1: EQUAL as the game asks.
-    static int exact_equal = -1;
-    if (exact_equal < 0) exact_equal = getenv("LARECOMP_EXACT_EQUAL") != NULL;
-    if (!decal_le && !exact_equal && hw_eps > 0 && st.ds[0] && !st.ds[1] && st.ds[2] == 3) decal_le = true;
+    // LARECOMP_EQUAL_LE=1 (diagnostic): depth EQUAL without writes (tests against a depth prepass) as LEQUAL with a few
+    // units of bias toward the camera - the decal path below - for when the prepass and shading vertex shaders disagree
+    // in the last bits. (Dread's almost black world was a translator bug instead: LDC's signed offset.)
+    static int equal_le = -1;
+    if (equal_le < 0) equal_le = getenv("LARECOMP_EQUAL_LE") != NULL;
+    if (!decal_le && equal_le && hw_eps > 0 && st.ds[0] && !st.ds[1] && st.ds[2] == 3) decal_le = true;
     // depth / stencil
     static uint64_t last_dsk;
     static id<MTLDepthStencilState> last_dss;
