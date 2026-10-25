@@ -67,7 +67,37 @@ static void handle_close(uint32_t h) {
 // Threads blocked in WaitSynchronization; object signals wake only these (caller holds g_klock).
 static KThread *g_syncwaiters;
 
-static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
+// Same-core preemption, approximated: on the Switch a thread that wakes a more urgent thread of its own core stops
+// right there until that thread blocks again; here both run at once, and the game relies on that order in places
+// (Dread's movie player frees what its dispatcher thread still waits on). wake() notes such threads (caller holds
+// g_klock), and the waker, back from its SVC (rt_svc), waits until they block again - at most 5 ms.
+// LARECOMP_NO_PREEMPT=1: off.
+static __thread KThread *t_urgent[8];
+static __thread int t_nurgent;
+static void wake(KThread *t) {
+    pthread_cond_signal(&t->cond);
+    if (t_cur && t != t_cur && t->core == t_cur->core && t->prio < t_cur->prio && t_nurgent < 8) t_urgent[t_nurgent++] = t;
+}
+static void yield_to_woken(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_PREEMPT") != NULL;
+    if (off) { t_nurgent = 0; return; }
+    uint64_t t0 = plat_now_ns();
+    for (;;) {
+        bool busy = false;
+        pthread_mutex_lock(&g_klock);
+        for (int i = 0; i < t_nurgent; i++) {
+            KThread *t = t_urgent[i];
+            if (!t->finished && t->wait_kind == WAIT_NONE && !t->in_sync_wait && !t->sleeping) busy = true;
+        }
+        pthread_mutex_unlock(&g_klock);
+        // (bounded: a woken thread that keeps running must not stall its waker for long. Where the game's order matters
+        // and a few ms aren't enough under load, it is fixed at the spot: runtime/hle/hooks.c, the movie dispatcher)
+        if (!busy || plat_now_ns() - t0 > 5000000ull) break;
+        usleep(10);
+    }
+    t_nurgent = 0;
+}
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
@@ -197,6 +227,9 @@ static void *thread_main(void *arg) {
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
     pthread_mutex_lock(&g_klock);
     t->finished = true;
+    if (getenv("LARECOMP_LOG_MOVIE")) LOG("[thread] handle %#x entry %llx arg %llx exited t=%llu\n", t->handle,
+                                           (unsigned long long)t->entry, (unsigned long long)t->cpu.x[0],
+                                           (unsigned long long)(plat_now_ns() / 1000));
     kernel_signal(&t->obj);
     pthread_mutex_unlock(&g_klock);
     t_cur = NULL;
@@ -598,6 +631,7 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
     svc_entry(c, imm, pc);
+    if (t_nurgent) yield_to_woken();
     rt_unwind_point();
 }
 
