@@ -329,7 +329,55 @@ void input_apply_background(void) {
 // is only a joystick to SDL, and the game reads gamepads only. gamecontrollerdb.txt in the data root holds the
 // player's own mappings, in SDL's format (lines for other platforms are skipped, so SDL_GameControllerDB's file works
 // as is). Called right after SDL_Init: a pad already connected becomes a gamepad then (SDL sends GAMEPAD_ADDED).
+// A virtual gamepad for tests: LARECOMP_VPAD="frame:button:frames,..." attaches one at startup (SDL then reports it as
+// a connected controller, opened by the GAMEPAD_ADDED path like a real pad) and holds its buttons as scripted. button:
+// SDL's gamepad button names (a, b, x, y, back, start, leftshoulder, rightshoulder, dpleft, ...), lefttrigger /
+// righttrigger, or a stick as leftx=<value> / lefty=<value> / rightx= / righty= (SDL axis values, y down positive).
+static SDL_Joystick *vpad;
+static void vpad_attach(void) {
+    if (!getenv("LARECOMP_VPAD")) return;
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.name = "Dread Recomp virtual pad";
+    SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
+    vpad = id ? SDL_OpenJoystick(id) : NULL;
+    LOG("[input] virtual pad %s\n", vpad ? "attached" : SDL_GetError());
+}
+static void vpad_frame(uint64_t frame) {
+    static const char *spec;
+    static int init;
+    if (!init) { init = 1; spec = getenv("LARECOMP_VPAD"); }
+    if (!spec || !vpad) return;
+    bool btn[SDL_GAMEPAD_BUTTON_COUNT] = {0};
+    int16_t axis[SDL_GAMEPAD_AXIS_COUNT] = {0};
+    static char buf[16384];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        unsigned long start = 0, len = 10;
+        char name[64] = "";
+        if (sscanf(tok, "%lu:%63[^:]:%lu", &start, name, &len) < 2 || frame < start || frame >= start + len) continue;
+        char *eq = strchr(name, '=');
+        if (eq) {
+            *eq = 0;
+            SDL_GamepadAxis a = SDL_GetGamepadAxisFromString(name);
+            if (a != SDL_GAMEPAD_AXIS_INVALID) axis[a] = (int16_t)atoi(eq + 1);
+        } else if (!strcmp(name, "lefttrigger") || !strcmp(name, "righttrigger")) {
+            axis[!strcmp(name, "lefttrigger") ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER] = 32767;
+        } else {
+            SDL_GamepadButton b = SDL_GetGamepadButtonFromString(name);
+            if (b != SDL_GAMEPAD_BUTTON_INVALID) btn[b] = true;
+        }
+    }
+    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) SDL_SetJoystickVirtualButton(vpad, i, btn[i]);
+    for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; i++) SDL_SetJoystickVirtualAxis(vpad, i, axis[i]);
+}
+
 void input_load_user_mappings(void) {
+    vpad_attach();  // (tests: LARECOMP_VPAD; here, right after SDL_Init)
     if (!SDL_GetPathInfo("gamecontrollerdb.txt", NULL)) return;
     int n = SDL_AddGamepadMappingsFromFile("gamecontrollerdb.txt");
     if (n < 0) LOG("[input] gamecontrollerdb.txt: %s\n", SDL_GetError());
@@ -630,6 +678,7 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+    vpad_frame(frame);
     const char *spec = getenv("LARECOMP_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
