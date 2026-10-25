@@ -40,16 +40,31 @@ Done (phases 0 to 2, part of phase 3):
   place; vertex shaders without fast math or FP contraction; depth `EQUAL` without writes is tested as biased `LEQUAL`
   (the prepass and G-buffer vertex shaders disagree in the last bits).
 
+Graphics fixes since (commits after the first snapshot):
+- **LDC's offset is signed** with an index register. Read as unsigned, every static mesh's x row came from past its
+  buffer, which caused the horizontal streaks, the black near geometry and the prepass/G-buffer depth mismatch. Exact
+  depth `EQUAL` and fast-math vertex shaders work again (the biased-`LEQUAL` workaround is now opt-in:
+  `LARECOMP_EQUAL_LE=1`).
+- TXD (sampling with explicit derivatives), AL2P and indexed vertex attribute loads, and the −16 self-branch at the
+  end of code.
+- Depth-only Metal pipelines for `BindProgram(null, fragment)`.
+- **Shader corpus:** `make corpus` translates and compiles with Metal all 832 unique shader stages in
+  `system/shd`. All pass; the GLSL translation passes with `CORPUS_ARGS=--glsl`.
+
+Rendering now matches reference screenshots of the opening area (the Chozo statue room) and looks right in the
+first caves, at 60 fps (120 presents a second on a 120 Hz display).
+
 Known problems, in priority order:
-1. **Rendering:** horizontal streaks across background layers, much near geometry dark, and an empty minimap. Start
-   from a debug frame (`LARECOMP_DEBUG_FRAME`) in the first room and walk the passes. Suspects: lighting and shadow
-   passes, texture formats and views, and the prepass/G-buffer depth workaround. A true vertex-only pipeline for
-   `BindProgram(null, fragment)` is still TODO (the prepass currently also runs the fragment shader).
-2. Audio is untested by ear (`audren` runs and mixes).
+1. **Audio:** the I3DL2 reverb effect (audio renderer effect type 5), which NintendoWare Atk uses, isn't implemented
+   (only type 4 reverb is), and nothing has been checked by ear.
+2. **Graphics, unverified areas:** only the opening, its caves and the cutscenes have been looked at. EMMI zones,
+   other regions, the hologram videos (several at once) and boss fights haven't. Suit colours in dark caves look
+   bluish; this isn't confirmed against the real game.
 3. Unhandled `am` commands (logged as ok), `ectx:aw` is a logging stub, and `nfp` (amiibo) is a stub.
 4. No menu or start screen yet (`runtime/ui/menu.mm` is a stub; F11 toggles fullscreen); the on-device game-code
    build (`runtime/gamebuild.c`) still knows only two modules.
-5. Vulkan (Linux/Windows) shares the NVN changes but hasn't been built.
+5. Vulkan (Linux/Windows) hasn't been built. It shares the translator fixes but not the depth-only pipelines, and
+   neither its NV12 movie upload nor its RGBX handling has been checked against the Metal changes.
 
 ## 1. What LASRecomp does (the model to follow)
 

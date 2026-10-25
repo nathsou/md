@@ -3206,8 +3206,11 @@ static void draw(CmdRec *r, bool indexed) {
         if (i >= st.nattrib || (a & 0xFF) == 0) used_streams |= 1u << 31;
         else used_streams |= 1u << ((a >> 8) & 0x1F);
     }
-    // pipeline
-    uint64_t phash = pipeline_state_hash(pr);
+    // pipeline. A vertex stage bound without its fragment stage (BindProgram(null, fragment): Dread's depth prepass)
+    // draws depth only: no fragment function, as on the Switch - its own fragment shader's discards would drop depth
+    // the prepass writes, and its colour work is wasted (nvn.h nvn_bind_program).
+    bool depth_only = (st.bound_stages & 1) && !(st.bound_stages & 2);
+    uint64_t phash = pipeline_state_hash(pr) ^ (depth_only ? 0x9e3779b97f4a7c15ull : 0);
     uint32_t pslot = (uint32_t)(phash ^ (phash >> 29)) & (PIPE_TAB - 1);
     while (pipe_tab[pslot].key && pipe_tab[pslot].key != phash) pslot = (pslot + 1) & (PIPE_TAB - 1);
     id<MTLRenderPipelineState> pipe = pipe_tab[pslot].key ? (__bridge id<MTLRenderPipelineState>)pipe_tab[pslot].pipe : nil;
@@ -3217,7 +3220,9 @@ static void draw(CmdRec *r, bool indexed) {
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     attachment_formats(pd);
     pipeline_desc(pd, pr, &rec);
+    if (depth_only) pd.fragmentFunction = nil;
     NSString *body = pipeline_key(pd, pr);
+    if (depth_only) body = [body stringByAppendingString:@" depth-only"];
     NSString *pk = [NSString stringWithFormat:@"%u %@", g_boot_gen, body];
     id pobj = cache[pk];
     NSMutableDictionary *ready_pipes = g_ready_pipes;  // async pipeline builds finished on Metal's threads

@@ -89,9 +89,8 @@ typedef struct NvnProgram {
 
 // The replay's program after BindProgram(program, bits) (cmdbuf.c): a program replaces what it binds; a null program
 // unbinds those stages, and a draw with no vertex stage left has no program. A vertex stage without its fragment stage
-// (a depth prepass) keeps drawing with the program's own fragment shader: the backends only build vertex + fragment
-// pipelines (TODO: a vertex-only pipeline, as nxnative does - the fragment shader's colour writes are extra work, and
-// its discards drop depth the prepass should write).
+// (a depth prepass) keeps the program: the backends translate vertex + fragment pairs, and Metal's draw then builds a
+// depth-only pipeline without the fragment function (renderer.m). TODO: the same for the Vulkan backend.
 static inline NvnProgram *nvn_bind_program(NvnProgram *cur, uint32_t *bound, NvnProgram *p, uint32_t bits) {
     if (p) {
         *bound = (*bound & ~bits) | (p->stage_mask & bits);
