@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "../kernel.h"
+#include "../game.h"
+#include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
 
@@ -826,7 +828,7 @@ NVN(nvnWindowInitialize) {
     w->interval = (int)G(uint32_t, A(1), 0x20);
     w->active = G(uint32_t, A(1), 0x24) ? (int)G(uint32_t, A(1), 0x24) : w->num;
     SET_HOST(A(0), w);
-    LOG("[nvn] window with %d textures\n", w->num);
+    LOG("[nvn] window with %d textures, present interval %d\n", w->num, w->interval);
     RET(1);
 }
 NVN(nvnWindowFinalize) { (void)c; }
@@ -863,9 +865,28 @@ NVN(nvnQueueAcquireTexture) {
     RET(0);
 }
 volatile uint64_t g_nvn_presents;  // presents so far (cmdbuf.c's list origins, debug)
+// The Switch shows a frame `interval` vsyncs (60 Hz) after the one before it, and the game's next frame waits for that:
+// a game in its 30 fps mode (interval 2) runs at 30 whatever the display. Unless the game runs uncapped
+// (GAME_UNCAPPED_FPS, LARECOMP_UNCAPPED=1), the presenting thread waits here until its frame's vsync. On a 60 Hz grid:
+// a frame late by less than a vsync keeps the grid (it takes the next slot), a later one starts it over.
+static void present_wait(int interval) {
+    static int uncapped = -1;
+    if (uncapped < 0) uncapped = game_flag(GAME_UNCAPPED_FPS) || (getenv("LARECOMP_UNCAPPED") && atoi(getenv("LARECOMP_UNCAPPED")));
+    if (uncapped || interval < 1) return;
+    const uint64_t vsync = 16666667;
+    static uint64_t due;  // when this frame may be shown (the last one's + its interval)
+    uint64_t now = plat_now_ns();
+    if (due > now) {
+        plat_sleep_until_ns(due);
+        extern __thread uint64_t g_blocked_ns;  // (kernel.c: waiting is idle time)
+        g_blocked_ns += plat_now_ns() - now;
+    } else if (now - due >= vsync) due = now;
+    due += (uint64_t)interval * vsync;
+}
 NVN(nvnQueuePresentTexture) {
     g_nvn_presents++;
     NvnWindow *w = HOST(NvnWindow, A(1));
+    present_wait(w->interval);
     int i = (int)A(2);
     if (getenv("LARECOMP_LOG_PRESENT")) {
         static int n;

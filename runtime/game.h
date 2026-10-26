@@ -39,6 +39,10 @@ typedef struct GameProfile {
 // stale pixels where the game never draws (Link's Awakening's interiors, Dread's room transitions). Games that keep
 // such targets' contents from frame to frame (ACNH's lazy clears decide themselves) don't want it.
 #define GAME_CLEAR_SCREEN_TARGETS 1u
+// Presents aren't held to the window's present interval: the game steps its world by elapsed time and runs at the
+// display's refresh rate (Dread: 120 fps on a 120 Hz Mac). Without it, a frame is shown no sooner than its interval
+// of 60 Hz vsyncs after the last, as on the Switch: games that step per frame (ACNH, 30 fps: interval 2) play at speed.
+#define GAME_UNCAPPED_FPS 2u
 static inline bool game_flag(uint32_t f);
 
 typedef struct GameInfo {
