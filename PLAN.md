@@ -386,5 +386,10 @@ by 0x490).
   ("expecting 'fragment' stage in pipeline no. N").
 
 ### Dumps that could not be supported
-Pikmin 2 (a RAR holding 940 MB of a 1.1 GB NSP) and Metroid Prime Remastered (an NSP missing its last 14.5 MB,
-which hold most of its exefs) are incomplete downloads: their game code isn't there. `extract.mts` now says so.
+Incomplete downloads, whose game code isn't there (`extract.mts` now says so for NSPs, from their file table, and
+XCIs, from the card header's last valid page, listing how much of each NCA is present):
+- Pikmin 2: a RAR holding 940 MB of a 1.1 GB NSP.
+- Metroid Prime Remastered: an NSP missing its last 14.5 MB, which hold most of its exefs.
+- Donkey Kong Country: Tropical Freeze (419 of 7,192 MiB), Game Builder Garage (788 of 1,356 MiB) and Tomodachi
+  Life: Living the Dream (152 of 6,737 MiB): XCIs cut short inside their Program NCA. Like most program NCAs, theirs
+  keep the exefs section last, after the romfs, so even the code is missing.
