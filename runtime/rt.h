@@ -27,12 +27,10 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
-// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// guest lives in a 13.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
 #define GUEST_LO     0x7000000000ull
-#define GUEST_HI     0x7320000000ull
-#define MAIN_BASE    0x7000000000ull
-#define SDK_BASE     0x7074000000ull   // after main: Dread's main is ~1.8 GB with its bss (ends ~0x70729bd000)
-#define SUBSDK0_BASE 0x7076000000ull   // subsdk0 (Dread: the SDK's movie library, ~7 MB)
+#define GUEST_HI     0x7360000000ull
+#define MAIN_BASE    0x7000000000ull   // the first module; the others follow it (tools/gen_game.py), below HLE_BASE
 #define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
 #define TLS_BASE     0x7090000000ull
@@ -43,6 +41,11 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 #define ALIAS_SIZE   0x0100000000ull
 #define HEAP_BASE    0x7240000000ull
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+// NVN virtual memory pools (no storage of their own: the GPU sees them at addresses physical pools are mapped to)
+// get theirs here, right after the heap, inside the range the renderer gives the GPU (GPU_SPAN from HEAP_BASE)
+#define VPOOL_BASE   (HEAP_BASE + HEAP_MAX)
+#define VPOOL_SIZE   0x0040000000ull   // 1 GB
+#define GPU_SPAN     (HEAP_MAX + VPOOL_SIZE)
 
 // ---- loader.c
 typedef struct Module {
@@ -53,8 +56,10 @@ typedef struct Module {
     uint64_t symtab, strtab, nsyms;
 } Module;
 
-extern Module g_modules[4];  // main, sdk, then subsdk0 when the game has one
+#define MAX_MODULES 12
+extern Module g_modules[MAX_MODULES];  // the game's modules in load order: main, subsdk0..9, sdk (tools/gen_game.py)
 extern int g_nmodules;
+Module *loader_module(const char *name);  // NULL: the game has no such module
 void loader_load(const char *exefs_dir);  // (again after a reboot: modules are reloaded into wiped memory)
 uint64_t loader_find_symbol(const char *name);
 const char *loader_symbol_at(uint64_t addr, uint64_t *offset);
@@ -79,10 +84,12 @@ typedef struct KThread KThread;
 void kernel_init(void);
 void kernel_stop_threads(void (*idle)(void));  // reboot: unwind every guest thread and join it (idle: called while waiting)
 void kernel_reset(void);                       // reboot: empty handle table, memory map, thread list
-KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio);
+KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio, int core);  // core: main.npdm's default
 void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4);
 uint32_t kernel_current_thread_handle(void);
 Cpu *kernel_current_cpu(void);
+void kernel_block_begin(void);  // host code blocks a guest thread outside the kernel: its core goes to another meanwhile
+void kernel_sched_point(void);  // a safe point: per-core scheduling (kernel.c)
 
 // ---- ipc.c
 typedef struct Service Service;

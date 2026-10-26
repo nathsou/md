@@ -6947,6 +6947,15 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_CLEAR_BUFFER:  // (address, size, 32-bit value) in command order
+            if (r->x[0] < GUEST_LO || r->x[0] + r->x[1] > GUEST_HI) break;
+            wait_why = "buffer clear";
+            renderer_flush();
+            for (uint64_t o = 0; o + 4 <= r->x[1]; o += 4) *(uint32_t *)(uintptr_t)(r->x[0] + o) = (uint32_t)r->x[2];
+            break;
+        case CMD_REPORT_VALUE:
+            if (r->x[1] >= GUEST_LO && r->x[1] < GUEST_HI) *(volatile uint32_t *)(uintptr_t)r->x[1] = (uint32_t)r->x[0];
+            break;
         case CMD_COPY_BUFFER_TO_BUFFER:
             wait_why = "buffer -> buffer copy";
             renderer_flush();

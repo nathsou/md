@@ -15,6 +15,7 @@
 
 #include <pthread.h>
 
+#include "../game.h"
 #include "../hle.h"
 // (LASRecomp's randomizer seeds replaced romfs files and had their own saves: no seeds here, so neither applies;
 // the overlay mechanism stays for romfs mods)
@@ -965,7 +966,11 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     case 7: {  // GetEntryType
         struct stat sb;
-        if (stat(p, &sb)) { resp->result = FS_PATH_NOT_FOUND; break; }
+        if (stat(p, &sb)) {
+            resp->result = FS_PATH_NOT_FOUND;
+            if (getenv("LARECOMP_LOG_FS_MISS")) LOG("[fs] GetEntryType %s: not there\n", p);
+            break;
+        }
         OUT(uint32_t, 0) = S_ISDIR(sb.st_mode) ? 0 : 1;
         resp_size(resp, 4);
         break;
@@ -992,7 +997,11 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
             }
         }
         if (fd < 0 && !scratch) fd = open(p, (mode & 2) ? O_RDWR : O_RDONLY);
-        if (fd < 0 && !dropped) { resp->result = errno_result(); break; }
+        if (fd < 0 && !dropped) {
+            resp->result = errno_result();
+            if (getenv("LARECOMP_LOG_FS_MISS")) LOG("[fs] OpenFile %s: not there\n", p);
+            break;
+        }
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         snprintf(f->path, sizeof f->path, "%s%s", p, dropped ? " (writes dropped)" : scratch ? " (scratch copy)" : "");
@@ -1024,6 +1033,9 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
 
 static Service *open_host_fs(const char *sub) {
     HostFs *fs = calloc(1, sizeof *fs);
+    static char game_save[200];  // save/<game> (runtime/game.h: the profile's id, or title-<title ID>)
+    snprintf(game_save, sizeof game_save, "save/%s", g_game.key);
+    g_save_dir = game_save;
     if (getenv("LARECOMP_SAVE_DIR")) g_save_dir = getenv("LARECOMP_SAVE_DIR");  // test runs use a scratch copy
     else if (rando_seed_dir()) {  // each randomizer seed has its own save slots
         static char seed_save[600];

@@ -214,7 +214,7 @@ static void log_to_file_without_terminal(void) {
 static void require_cpu(void) {
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    fprintf(stderr, "FATAL: Dread Recomp needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
+    fprintf(stderr, "FATAL: nx needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
                     "newer).\n");
     exit(1);
 }
@@ -336,11 +336,11 @@ void plat_fatal_notice(void) {
     rt_crash_explain(text, sizeof text, g_log_path);
     if (!g_log_path[0]) return;
     fflush(stderr);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Dread Recomp", text, NULL);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "nx", text, NULL);
 }
 
 static void *notice_thread(void *text) {
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Dread Recomp", text, NULL);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "nx", text, NULL);
     free(text);
     return NULL;
 }

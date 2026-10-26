@@ -1,5 +1,6 @@
 // Vulkan textures: NVN formats, images, change-detected uploads from guest memory, views and samplers
 // (counterpart of the texture half of metal.m and the view helpers of renderer.m).
+#include "game.h"
 #include <SDL3/SDL_timer.h>
 #include <float.h>
 #include <math.h>
@@ -227,7 +228,7 @@ bool renderer_texture_frame_fresh(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     extern uint64_t renderer_exec_frame(void);
     uint64_t total_frames = renderer_exec_frame();  // (the frame being translated)
-    if (!b || !b->scalable || b->frame_cleared == total_frames + 1) return false;
+    if (!b || !b->scalable || b->frame_cleared == total_frames + 1 || !game_flag(GAME_CLEAR_SCREEN_TARGETS)) return false;
     // LARECOMP_NO_FRAME_CLEAR skips the clear only while the contents cover the whole target: below 1x a frame draws
     // into part of it, and the rest would show what an earlier frame left there (issue #205: the upper part flickered)
     // (Dynamic: the contents cover the whole target only at the factor 1 - its render scale is the allocation's)
@@ -239,7 +240,7 @@ bool renderer_texture_frame_fresh(NvnTexture *t) {
 bool renderer_texture_level_fresh(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     static int keep = -1;
-    if (keep < 0) keep = getenv("LARECOMP_KEEP_TARGETS") != NULL;
+    if (keep < 0) keep = getenv("LARECOMP_KEEP_TARGETS") != NULL || !game_flag(GAME_CLEAR_SCREEN_TARGETS);
     if (!b || keep || b->level_gen == g_level_gen) return false;
     if (!b->scalable) { b->level_gen = g_level_gen; return false; }
     bool fresh = b->level_gen != 0;

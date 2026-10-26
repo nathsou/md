@@ -176,6 +176,7 @@ static void wait_until(pthread_cond_t *cv, bool (*ready)(uint64_t), uint64_t arg
     bool warned = false;
     bool noted = what && !ready(arg);
     if (noted) rq_watch(what, arg);
+    if (guest && !ready(arg)) kernel_block_begin();  // (a GPU wait: a kernel wait on the Switch)
     while (!ready(arg)) {
         if (guest && g_rt_unwind) break;
         struct timespec ts;
@@ -331,15 +332,29 @@ static void fences_add(Fences *f, uint64_t guest) {
     f->p[f->n++] = guest;
 }
 static void prescan(uint64_t handle, Fences *f, int depth) {
-    uint64_t p = handle;
+    uint64_t p = handle, prev = 0;
     for (int guard = 0; guard < 10000000; guard++) {
+        if (p < 0x100000) {  // (a broken list: exec_list skips it too)
+            static int nlog;
+            if (nlog++ < 8) LOG("[rq] command list %#llx: record at %#llx (after %#llx op %u size %u) - stopped\n",
+                                (unsigned long long)handle, (unsigned long long)p, (unsigned long long)prev,
+                                prev ? ((const CmdRec *)(uintptr_t)prev)->op : 0, prev ? ((const CmdRec *)(uintptr_t)prev)->size : 0);
+            return;
+        }
         const CmdRec *r = (const CmdRec *)(uintptr_t)p;
+        prev = p;
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = (const uint64_t *)r->extra;
-            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) prescan(h[i], f, depth + 1);
+            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++)
+                if (h[i] >= 0x100000) prescan(h[i], f, depth + 1);
+                else {
+                    static int nlog;
+                    if (nlog++ < 8) LOG("[rq] command list %#llx calls %#llx (#%llu of %llu): skipped\n", (unsigned long long)handle,
+                                        (unsigned long long)h[i], (unsigned long long)i, (unsigned long long)r->x[0]);
+                }
             break;
         }
         case CMD_FENCE_SYNC:

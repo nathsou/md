@@ -96,7 +96,7 @@ static bool writable(const char *dir) {
 
 static void fail(const char *msg) {
     fprintf(stderr, "%s\n", msg);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Dread Recomp", msg, NULL);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "nx", msg, NULL);
     exit(1);
 }
 
@@ -220,7 +220,7 @@ static bool pointer_root(const char *home, char *out, size_t n) {
 bool rt_data_root_early(char *out, size_t n) {
     const char *env = getenv("LARECOMP_DATA_ROOT");
     if (env && *env) return (size_t)snprintf(out, n, "%s", env) < n;
-    if (is_dir("extracted")) return false;  // (dev mode)
+    if (is_dir("extracted") || (is_dir("data") && is_dir("games"))) return false;  // (dev mode)
     char home[1024];
     default_home(home, sizeof home);
     if (!pointer_root(home, out, n) || !is_dir(out)) snprintf(out, n, "%s", home);
@@ -294,20 +294,22 @@ void rt_paths_init(void) {
     char root[1024];
     const char *env = getenv("LARECOMP_DATA_ROOT");
     if (env && *env) snprintf(root, sizeof root, "%s", env);
-    // dev / portable: a checkout with the game files in it (exefs/ and romfs/ here, or LASRecomp's extracted/)
-    else if (is_dir("extracted") || (is_dir("exefs") && is_dir("romfs"))) snprintf(root, sizeof root, "%s", g_start), g_dev = true;
+    // dev / portable: a checkout with the game files in it (data/<game>/ next to games/; or exefs/ and romfs/ here, or
+    // LASRecomp's extracted/)
+    else if ((is_dir("data") && is_dir("games")) || is_dir("extracted") || (is_dir("exefs") && is_dir("romfs")))
+        snprintf(root, sizeof root, "%s", g_start), g_dev = true;
     else {
         snprintf(root, sizeof root, "%s", g_home);
         char ptr[1024];
         while (pointer_root(g_home, ptr, sizeof ptr)) {  // another folder chosen on the start screen
             if (is_dir(ptr) && writable(ptr)) { snprintf(root, sizeof root, "%s", ptr); break; }
             char msg[1400];
-            snprintf(msg, sizeof msg, "Dread Recomp's data folder isn't available:\n%s\n\nIf it's on a drive that isn't "
+            snprintf(msg, sizeof msg, "nx's data folder isn't available:\n%s\n\nIf it's on a drive that isn't "
                      "connected, connect it and try again.", ptr);
             const SDL_MessageBoxButtonData b[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Try again"},
                                                   {0, 1, "Use the default folder"},
                                                   {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 2, "Quit"}};
-            const SDL_MessageBoxData box = {SDL_MESSAGEBOX_WARNING, NULL, "Dread Recomp", msg, 3, b, NULL};
+            const SDL_MessageBoxData box = {SDL_MESSAGEBOX_WARNING, NULL, "nx", msg, 3, b, NULL};
             int k = 2;
             if (!SDL_ShowMessageBox(&box, &k)) fprintf(stderr, "%s\n", msg);
             if (k == 2) exit(1);
@@ -322,11 +324,11 @@ void rt_paths_init(void) {
     char msg[1400];
     if (!is_dir(root) || !writable(root) || chdir(root) != 0) {
 #ifdef _WIN32
-        snprintf(msg, sizeof msg, "Dread Recomp can't write to its folder:\n%s\n\nIt keeps game files, saves and seeds "
-                 "next to the program. Move the \"Dread Recomp\" folder somewhere you can write to (e.g. Documents or "
+        snprintf(msg, sizeof msg, "nx can't write to its folder:\n%s\n\nIt keeps game files, saves and seeds "
+                 "next to the program. Move the \"nx\" folder somewhere you can write to (e.g. Documents or "
                  "Desktop, not Program Files) and start it again.", root);
 #else
-        snprintf(msg, sizeof msg, "Dread Recomp can't write to its data folder:\n%s", root);
+        snprintf(msg, sizeof msg, "nx can't write to its data folder:\n%s", root);
 #endif
         fail(msg);
     }
@@ -513,7 +515,7 @@ static unsigned long long entries_size(const char *dir) {
     return n;
 }
 
-// Dread Recomp's data (an unfinished copy too), or nothing yet
+// nx's data (an unfinished copy too), or nothing yet
 static bool usable_dir(const char *dir) {
     char p[1100];
     join(p, sizeof p, dir, MARK_PARTIAL);
@@ -528,10 +530,10 @@ void rt_data_target(const char *picked, RtDataTarget *t) {
         snprintf(t->refuse, sizeof t->refuse, "That folder can't be opened.");
         return;
     }
-    // the folder itself when it's empty, Dread Recomp's data, or the platform's folder; otherwise a "Dread Recomp"
+    // the folder itself when it's empty, nx's data, or the platform's folder; otherwise a "nx"
     // folder in it
     if (same_dir(r, g_home) || usable_dir(r)) snprintf(t->path, sizeof t->path, "%s", r);
-    else join(t->path, sizeof t->path, r, "Dread Recomp");
+    else join(t->path, sizeof t->path, r, "nx");
     join(p, sizeof p, t->path, MARK_PARTIAL);
     t->has_data = has_entries(t->path) && !exists(p);
     t->bytes = entries_size(g_root);
@@ -543,7 +545,7 @@ void rt_data_target(const char *picked, RtDataTarget *t) {
     else if (within(t->path, root)) snprintf(t->refuse, sizeof t->refuse, "That folder is inside the data folder.");
     else if (within(root, t->path)) snprintf(t->refuse, sizeof t->refuse, "That folder holds the data folder.");
     else if (in_app(r)) snprintf(t->refuse, sizeof t->refuse, "That folder is inside the app.");
-    else if (!writable(r)) snprintf(t->refuse, sizeof t->refuse, "Dread Recomp can't write to that folder.");
+    else if (!writable(r)) snprintf(t->refuse, sizeof t->refuse, "nx can't write to that folder.");
     else if (!same_dir(t->path, g_home) && !usable_dir(t->path))
         snprintf(t->refuse, sizeof t->refuse, "Choose an empty folder.");
 }
@@ -705,7 +707,7 @@ static bool prepare_target(const char *to, char *err, size_t n) {
     char p[1100];
     mkdirs(to);
     if (!is_dir(to) || !writable(to)) {
-        snprintf(err, n, "Dread Recomp can't write to %s.", to);
+        snprintf(err, n, "nx can't write to %s.", to);
         return false;
     }
     join(p, sizeof p, to, MARK_PARTIAL);
@@ -736,7 +738,7 @@ bool rt_data_move(const char *to, void (*progress)(int step, double frac), char 
         return false;
     }
     if (has_entries(abs_to)) {
-        snprintf(err, n, "That folder already has Dread Recomp data.");
+        snprintf(err, n, "That folder already has nx data.");
         return false;
     }
     Move m = {progress, 0, entries_size(from), 0, err, n, malloc(MOVE_BUF), malloc(MOVE_BUF)};

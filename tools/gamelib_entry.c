@@ -1,13 +1,13 @@
-// Entry of the game code library (runtime/gamelib.h), compiled into it with the generated code: the function
-// tables, found by name when the app loads the library. Everything else in it stays hidden.
+// Entry of the game code library (runtime/gamelib.h), compiled into it with the generated code: the module tables
+// (gamelib_modules.c, written by tools/gen_game.py), found by name when the app loads the library. Everything else in
+// it stays hidden.
 #include "gamelib.h"
 
-extern const uint64_t main_fn_addrs[], sdk_fn_addrs[], subsdk0_fn_addrs[], main_fn_count, sdk_fn_count, subsdk0_fn_count;
-extern const GuestFn main_fn_ptrs[], sdk_fn_ptrs[], subsdk0_fn_ptrs[];
+extern const GameLibModule gamelib_modules[];
+extern const uint32_t gamelib_nmodules;
 
-GAMELIB_EXPORT const GameLibTables *dreadgame_tables(void) {
-    static const GameLibTables t = {GAMELIB_ABI,       GAMELIB_ID,      main_fn_addrs,     sdk_fn_addrs,
-                                    main_fn_ptrs,      sdk_fn_ptrs,     &main_fn_count,    &sdk_fn_count,
-                                    subsdk0_fn_addrs,  subsdk0_fn_ptrs, &subsdk0_fn_count};
+GAMELIB_EXPORT const GameLibTables *gamelib_entry_tables(void) {
+    static GameLibTables t;
+    t = (GameLibTables){GAMELIB_ABI, GAMELIB_ID, gamelib_nmodules, gamelib_modules};
     return &t;
 }

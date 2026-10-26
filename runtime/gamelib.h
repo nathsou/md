@@ -11,13 +11,13 @@
 #include "cpu.h"
 
 #if defined(_WIN32)
-#define GAMELIB_NAME "dreadgame.dll"
+#define GAMELIB_NAME "game.dll"
 #define GAMELIB_EXPORT __declspec(dllexport)
 #elif defined(__APPLE__)
-#define GAMELIB_NAME "dreadgame.dylib"
+#define GAMELIB_NAME "game.dylib"
 #define GAMELIB_EXPORT __attribute__((visibility("default")))
 #else
-#define GAMELIB_NAME "dreadgame.so"
+#define GAMELIB_NAME "game.so"
 #define GAMELIB_EXPORT __attribute__((visibility("default")))
 #endif
 
@@ -27,7 +27,7 @@
 #ifndef GAMELIB_ID
 #define GAMELIB_ID "dev"
 #endif
-#define GAMELIB_ABI 2  // (2: subsdk0's tables)
+#define GAMELIB_ABI 3  // (3: a list of modules with their load addresses)
 #define GAMELIB_FULL_ID_SIZE 96
 
 // The id a library for the game files in game_dir has (GAMELIB_ID-<build ID>); false when exefs/main is unreadable.
@@ -45,27 +45,33 @@ static inline bool gamelib_full_id(const char *game_dir, char *out, size_t size)
     return true;
 }
 
+// One recompiled module (exefs/<name>), at the load address its code was generated for (tools/gen_game.py).
+typedef struct {
+    const char *name;        // "main", "subsdk0", "sdk"
+    uint64_t base, size;     // load address, size with bss
+    const uint64_t *addrs;   // sorted guest addresses of its functions
+    const GuestFn *fns;      // the functions at them
+    const uint64_t *count;
+} GameLibModule;
+
 typedef struct {
     uint32_t abi;    // GAMELIB_ABI
     const char *id;  // GAMELIB_ID-<build ID> (gamelib_full_id)
-    const uint64_t *main_addrs, *sdk_addrs;  // sorted guest addresses
-    const GuestFn *main_fns, *sdk_fns;       // the functions at them
-    const uint64_t *main_count, *sdk_count;
-    const uint64_t *subsdk0_addrs;  // subsdk0 (NULL count: the game has none)
-    const GuestFn *subsdk0_fns;
-    const uint64_t *subsdk0_count;
+    uint32_t nmodules;
+    const GameLibModule *modules;  // in load order: main, subsdk*, sdk
 } GameLibTables;
 
 // The library's one exported function (tools/gamelib_entry.c).
 typedef const GameLibTables *(*GameLibEntry)(void);
-#define GAMELIB_ENTRY "dreadgame_tables"
+#define GAMELIB_ENTRY "gamelib_entry_tables"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Loads the game code for the game files in game_dir (once; later calls return the first result). Looks at
-// LARECOMP_GAME_LIB, next to the executable (a source checkout's build/), then game_dir. false: why says what's wrong.
+// LARECOMP_GAME_LIB, then <dir>/game.<dylib|so|dll> in each folder next to the executable (a source checkout's
+// build/<game>/: the one whose id matches), then game_dir. false: why says what's wrong.
 bool gamelib_load(const char *game_dir, char *why, size_t why_size);
 // The tables of the loaded library (NULL before gamelib_load succeeds).
 const GameLibTables *gamelib_tables(void);

@@ -12,7 +12,7 @@ FIRST=${3:-0}
 LAST=${4:-999}
 OUT=build/cp
 mkdir -p "$OUT"
-USERDATA=save/save_0/userdata  # (which profiles exist: this machine's, from any earlier boot)
+USERDATA=save/dread/save_0/userdata  # (which profiles exist: this machine's, from any earlier boot)
 
 # EXPLORE=<seconds> (default 180): after continuing, alternate runs right and left (about 15 s each) jumping, shooting,
 # firing missiles (R + Y) and aiming (L), and capture every 1500 frames; EXPLORE=0: the quick check (a few steps each
@@ -51,7 +51,7 @@ run_one() {
     [ -d "$dir/userdata" ] && cp -R "$dir/userdata" "$o/save/save_0/" || cp -R "$USERDATA" "$o/save/save_0/"
     local t0=$(date +%s)
     LARECOMP_NO_LAUNCHER=1 LARECOMP_NO_AUDIO=1 LARECOMP_SAVE_DIR="$o/save" LARECOMP_FRAMES_DIR="$o" \
-        LARECOMP_INPUT="$INPUT" LARECOMP_SHOT_AT="$SHOTS" timeout "$TIMEOUT" ./build/dreadrecomp . > "$o/run.log" 2>&1
+        LARECOMP_INPUT="$INPUT" LARECOMP_SHOT_AT="$SHOTS" timeout "$TIMEOUT" ./build/nx ${GAME_DIR:-data/dread} > "$o/run.log" 2>&1
     local rc=$?
     local shots=$(ls "$o"/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
     local crash=$(grep -cE '^\*\*\* signal|^FATAL' "$o/run.log")

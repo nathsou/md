@@ -341,7 +341,7 @@ static void vpad_attach(void) {
     d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
     d.naxes = SDL_GAMEPAD_AXIS_COUNT;
     d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
-    d.name = "Dread Recomp virtual pad";
+    d.name = "nx virtual pad";
     SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
     vpad = id ? SDL_OpenJoystick(id) : NULL;
     LOG("[input] virtual pad %s\n", vpad ? "attached" : SDL_GetError());
@@ -865,6 +865,20 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left)
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
 
+// int GetNpadStates(State *out, int count, const NpadId &id): the latest state, as one sample (the state's own
+// sampling number tells the game it is new)
+static void fill_states(Cpu *c) {
+    if ((int)c->x[1] < 1) { c->x[0] = 0; return; }
+    c->x[1] = c->x[2];
+    fill_state(c);
+    c->x[0] = 1;
+}
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", hid_states_fullkey) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", hid_states_dual) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", hid_states_left) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", hid_states_handheld) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", hid_states_right) { fill_states(c); }
+
 // FullKey for player 1 only (we report docked mode, where Handheld is unavailable)
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
@@ -909,4 +923,37 @@ HLE_FUNC("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21
     info[0] = 1;        // VibrationDeviceType_LinearResonantActuator
     int side = rumble_side(h);
     info[1] = side < 0 ? 0 : (uint32_t)side + 1;  // None=0, Left=1, Right=2
+}
+
+// The other inputs, read by the SDK from LIFOs in HID shared memory, which stay empty here (no LIFO headers): its
+// readers then copied garbage counts of entries - ACNH's name entry polled the touch screen and wrote touch after
+// touch past its one-state buffer into the heap. Answered directly: nothing touched, typed, moved or connected.
+static int64_t other_sampling;
+#define TOUCH_STATE_SIZE(n) (0x10 + 0x28 * (n))  // TouchScreenState<N>: sampling, count, reserved, TouchState[N]
+HLE_FUNC("_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE", hid_touch_state1) {
+    memset((void *)(uintptr_t)c->x[0], 0, TOUCH_STATE_SIZE(1));
+    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+}
+HLE_FUNC("_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi", hid_touch_states16) {
+    if ((int)c->x[1] < 1) { c->x[0] = 0; return; }
+    memset((void *)(uintptr_t)c->x[0], 0, TOUCH_STATE_SIZE(16));
+    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+    c->x[0] = 1;
+}
+HLE_FUNC("_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE", hid_keyboard_state) {
+    memset((void *)(uintptr_t)c->x[0], 0, 0x2C);  // sampling, modifiers, keys[256 bits]
+    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+}
+HLE_FUNC("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", hid_mouse_states) {
+    if ((int)c->x[1] < 1) { c->x[0] = 0; return; }
+    memset((void *)(uintptr_t)c->x[0], 0, 0x28);  // sampling, x, y, dx, dy, wheel dx / dy, buttons, attributes
+    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+    c->x[0] = 1;
+}
+HLE_FUNC("_ZN2nn3hid16GetDebugPadStateEPNS0_13DebugPadStateE", hid_debug_pad_state) {
+    memset((void *)(uintptr_t)c->x[0], 0, 0x20);  // sampling, attributes, buttons, sticks
+    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+}
+HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", hid_six_axis_states) {
+    c->x[0] = 0;  // no motion samples
 }

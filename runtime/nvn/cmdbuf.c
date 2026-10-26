@@ -1,6 +1,7 @@
 // NVN command buffers: commands are recorded into the guest-provided command memory as CmdRec
 // records, so the game's own memory management and out-of-memory callbacks work as designed.
 // A command handle is the guest address of a list's first record.
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,22 +30,26 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
 
 NVN(nvnCommandBufferAddCommandMemory) {
     NvnCmdBuf *cb = cb_of(A(0));
-    uint64_t mem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
-    if (cb->recording && cb->mem) {
-        // chain the list being recorded into the new chunk
-        CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
-        j->x[0] = mem;
-    }
-    cb->mem = mem;
-    cb->size = size;
-    cb->used = 0;
+    uint64_t mem = A(1) ? HOST(NvnPool, A(1))->storage + A(2) : 0, size = A(3);
+    if (!mem) LOG("[nvn] AddCommandMemory with no memory pool (offset %#llx size %#llx)\n", (unsigned long long)A(2),
+                  (unsigned long long)size);
+    // (the records go to the chunk's own segments - rec - chained from the list being recorded, if any: cb->mem
+    // stays where the records are until then)
+    cb->chunk = mem;
+    cb->chunk_size = size;
+    cb->vused = 0;
+    static int noreuse = -1;  // LARECOMP_CMD_NOREUSE=1 (experiment): a chunk given again gets new segments (leaks)
+    if (noreuse < 0) noreuse = getenv("LARECOMP_CMD_NOREUSE") != NULL;
+    if (!noreuse) cb->overflow_next = 0;
+    cb->segment_pending = true;
 }
 NVN(nvnCommandBufferAddControlMemory) { (void)c; }
-NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->size); }
-NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used); }
+// (the game's view: NVN's own encoding in its chunk - cmdbuf.c rec)
+NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->chunk_size); }
+NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->vused); }
 NVN(nvnCommandBufferGetCommandMemoryFree) {
     NvnCmdBuf *cb = cb_of(A(0));
-    RET(cb->size > cb->used + JUMP_RESERVE ? cb->size - cb->used - JUMP_RESERVE : 0);
+    RET(cb->chunk_size > cb->vused ? cb->chunk_size - cb->vused : 0);
 }
 NVN(nvnCommandBufferGetControlMemorySize) { RET(0x10000); }
 NVN(nvnCommandBufferGetControlMemoryUsed) { RET(0); }
@@ -55,23 +60,91 @@ NVN(nvnCommandBufferSetMemoryCallbackData) { cb_of(A(0))->callback_data = A(1); 
 NVN(nvnCommandBufferGetMemoryCallbackData) { RET(cb_of(A(0))->callback_data); }
 NVN(nvnCommandBufferSetCommandMemoryCallbackEnabled) { (void)c; }
 
+// Command memory. Our records (CmdRec: the call's arguments as they came) are several times larger than the GPU command
+// words NVN encodes, and games size their command memory for those: ACNH records a command set once to measure it
+// (nvnCommandBufferGetCommandMemoryUsed), then allocates exactly that much, gives some buffers 512-byte chunks with an
+// out-of-memory callback that does nothing, and puts its own data in what its chunks have left over. So the game's
+// chunks stay the game's: what it sees is what NVN's encoding would about use in them (vused: a method word and the
+// data per command), its callback is called when that runs out, as on the Switch, and the records themselves go into
+// segments of runtime memory that belong to the chunk (by its address). When the game gives the same chunk again, what
+// was recorded in it is dead to the game, and so are its segments: they are used again, so a chunk reused every frame
+// costs no more memory.
+// Segments are host memory (the records are only read by the renderer), each sized to the chunk it extends: about six
+// times the chunk (our records against NVN's words), 512 bytes to 64 KB, the later ones of a chunk twice the one before.
+#define OVERFLOW_MAX 0x10000
+typedef struct Overflow { uint64_t origin; int n, cap; uint64_t *segs; uint32_t *sizes; struct Overflow *next; } Overflow;
+static Overflow *overflow_tab[4096];
+static pthread_mutex_t overflow_lock = PTHREAD_MUTEX_INITIALIZER;
+RT_ON_RESET(cmdbuf_overflow_reset) {
+    for (int i = 0; i < 4096; i++)
+        for (Overflow *o = overflow_tab[i], *n; o; o = n) {
+            n = o->next;
+            for (int k = 0; k < o->n; k++) free((void *)(uintptr_t)o->segs[k]);
+            free(o->segs), free(o->sizes), free(o);
+        }
+    memset(overflow_tab, 0, sizeof overflow_tab);
+}
+
+// The chunk's i-th segment (made when first needed, at least min bytes); *size: its size
+static uint64_t overflow_seg(uint64_t origin, uint64_t chunk_size, int i, uint32_t min, uint64_t *size) {
+    pthread_mutex_lock(&overflow_lock);
+    Overflow **b = &overflow_tab[(origin >> 4) % 4096], *o = *b;
+    while (o && o->origin != origin) o = o->next;
+    if (!o) {
+        o = calloc(1, sizeof *o);
+        o->origin = origin, o->next = *b, *b = o;
+    }
+    if (i < o->n && o->sizes[i] < min) {  // (too small for this record: a bigger one in its place)
+        free((void *)(uintptr_t)o->segs[i]);
+        o->segs[i] = (uint64_t)(uintptr_t)calloc(1, min);
+        o->sizes[i] = min;
+    }
+    while (o->n <= i) {
+        if (o->n == o->cap) {
+            o->cap = o->cap ? o->cap * 2 : 4;
+            o->segs = realloc(o->segs, sizeof *o->segs * (size_t)o->cap);
+            o->sizes = realloc(o->sizes, sizeof *o->sizes * (size_t)o->cap);
+        }
+        uint64_t sz = o->n ? (uint64_t)o->sizes[o->n - 1] * 2 : (chunk_size * 6 + 0xFF) & ~0xFFull;
+        if (sz < 512) sz = 512;
+        if (sz > OVERFLOW_MAX) sz = OVERFLOW_MAX;
+        if (sz < min) sz = min;
+        o->segs[o->n] = (uint64_t)(uintptr_t)calloc(1, sz);
+        o->sizes[o->n++] = (uint32_t)sz;
+    }
+    uint64_t seg = o->segs[i];
+    *size = o->sizes[i];
+    pthread_mutex_unlock(&overflow_lock);
+    return seg;
+}
+
 // Reserve a record. May call back into the guest for more memory, so callers snapshot their
 // arguments first.
 static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     uint32_t size = (uint32_t)((sizeof(CmdRec) + extra + 7) & ~7u);
-    for (int tries = 0; !cb->mem || cb->used + size + JUMP_RESERVE > cb->size; tries++) {
-        if (!cb->callback || tries == 2) FATAL("nvn: out of command memory (need %u)\n", size);
+    // (NVN's encoding is a few method words plus the data; the game only needs the same commands to measure the same
+    // each time - it records them again into what it measured - so this errs low: its fixed-size heaps fit)
+    uint32_t vsize = (8 + extra + 7) & ~7u;
+    for (int tries = 0; cb->callback && tries < 2 && (!cb->chunk || cb->vused + vsize > cb->chunk_size); tries++) {
         uint64_t saved[8];
         memcpy(saved, c->x, sizeof saved);
         c->x[0] = cb->guest;
         c->x[1] = 0;  // NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY
-        c->x[2] = size + JUMP_RESERVE;
+        c->x[2] = vsize;
         c->x[3] = cb->callback_data;
         guest_call(c, cb->callback);
         memcpy(c->x, saved, sizeof saved);
     }
+    if (!cb->chunk) FATAL("nvn: a command buffer records with no command memory\n");
+    if (cb->segment_pending || cb->used + size + JUMP_RESERVE > cb->size) {  // (the records: on into the next segment)
+        cb->segment_pending = false;
+        uint64_t seg_size, seg = overflow_seg(cb->chunk, cb->chunk_size, cb->overflow_next++, size + JUMP_RESERVE, &seg_size);
+        if (cb->recording && cb->mem) raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec))->x[0] = seg;
+        cb->mem = seg, cb->size = seg_size, cb->used = 0;
+    }
     CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
     cb->used += size;
+    cb->vused += vsize;
     return r;
 }
 
@@ -81,9 +154,23 @@ NVN(nvnCommandBufferBeginRecording) {
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
 }
+// (debug frame) when each list was recorded: the frame and the command buffer, by its handle
+#define LIST_LOG 4096
+static struct { uint64_t handle, frame, cb; } list_log[LIST_LOG];
+void nvn_list_origin(uint64_t handle, uint64_t *frame, uint64_t *cb) {
+    *frame = *cb = 0;
+    for (int i = 0; i < LIST_LOG; i++)
+        if (list_log[i].handle == handle && list_log[i].frame >= *frame) { *frame = list_log[i].frame; *cb = list_log[i].cb; }
+}
 NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     rec(c, cb, CMD_END, 0);
+    {
+        extern volatile uint64_t g_nvn_presents;
+        static unsigned k;
+        unsigned i = __atomic_fetch_add(&k, 1, __ATOMIC_RELAXED) % LIST_LOG;
+        list_log[i].handle = cb->start, list_log[i].frame = g_nvn_presents, list_log[i].cb = cb->guest;
+    }
     cb->recording = false;
     RET(cb->start);
 }
@@ -139,9 +226,25 @@ NVN(nvnCommandBufferBindVertexBuffer) {
     memcpy(r->extra, &s.x[2], 16);
 }
 // (cmd, stage, first, count, const NVNbufferRange*)
-NVN(nvnCommandBufferBindUniformBuffers) { record_copy(c, CMD_BIND_UNIFORM_BUFFERS, 4, (uint32_t)A(3) * 16); }
+NVN(nvnCommandBufferBindUniformBuffers) {
+    const uint64_t *rg = (const uint64_t *)AP(4);  // (debug: an address outside guest memory)
+    for (uint32_t i = 0; rg && i < (uint32_t)A(3); i++)
+        if (rg[2 * i] && (rg[2 * i] < GUEST_LO || rg[2 * i] >= GUEST_HI)) {
+            static int nlog;
+            if (nlog++ < 8) LOG("[nvn] BindUniformBuffers stage %llu slot %llu address %#llx size %#llx (lr %#llx)\n",
+                                (unsigned long long)A(1), (unsigned long long)(A(2) + i), (unsigned long long)rg[2 * i],
+                                (unsigned long long)rg[2 * i + 1], (unsigned long long)c->x[30]);
+        }
+    record_copy(c, CMD_BIND_UNIFORM_BUFFERS, 4, (uint32_t)A(3) * 16);
+}
 NVN(nvnCommandBufferBindUniformBuffer) {
     Snap s = snap(c);
+    if (s.x[3] && (s.x[3] < GUEST_LO || s.x[3] >= GUEST_HI)) {  // (debug: an address outside guest memory)
+        static int nlog;
+        if (nlog++ < 8) LOG("[nvn] BindUniformBuffer stage %llu slot %llu address %#llx size %#llx (lr %#llx)\n",
+                            (unsigned long long)s.x[1], (unsigned long long)s.x[2], (unsigned long long)s.x[3],
+                            (unsigned long long)s.x[4], (unsigned long long)c->x[30]);
+    }
     CmdRec *r = record(c, CMD_BIND_UNIFORM_BUFFERS, 16, &s);
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 16);
@@ -263,7 +366,10 @@ PLAIN(nvnCommandBufferSetLineWidth, CMD_SET_LINE_WIDTH)
 PLAIN(nvnCommandBufferSetPointSize, CMD_SET_POINT_SIZE)
 PLAIN(nvnCommandBufferSetSampleMask, CMD_SET_SAMPLE_MASK)
 PLAIN(nvnCommandBufferSetRenderEnable, CMD_SET_RENDER_ENABLE)
-NVN(nvnCommandBufferSetRenderEnableConditional) { (void)c; }
+// SetRenderEnableConditional(cmd, mode, counters): draws and clears run only while the two counter reports there
+// (16 bytes each) compare equal (mode 0) / different (mode 1), read when the GPU gets here (the renderer). agl's lazy
+// render target clears use it: clear under the condition, then report a counter over it, so later clears are skipped.
+PLAIN(nvnCommandBufferSetRenderEnableConditional, CMD_SET_RENDER_ENABLE_CONDITIONAL)
 NVN(nvnCommandBufferSetDepthClamp) { (void)c; }
 NVN(nvnCommandBufferSetRasterizerDiscard) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterEnable) { (void)c; }
@@ -449,10 +555,31 @@ PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
 PLAIN(nvnCommandBufferSignalEvent, CMD_SIGNAL_EVENT)
 PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
-NVN(nvnCommandBufferReportValue) { (void)c; }
+PLAIN(nvnCommandBufferReportValue, CMD_REPORT_VALUE)  // (x0: the 32-bit value, x1: where)
 NVN(nvnCommandBufferResetCounter) { (void)c; }
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
-NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
+// CopyCommands(cmd, count, handles): the lists' commands are copied in now (CallCommands calls them when the queue
+// runs): the game may record new commands where they were as soon as this returns - ACNH does, every frame, for its
+// small per-pass lists, and calling them later ran whatever it had recorded there since.
+NVN(nvnCommandBufferCopyCommands) {
+    NvnCmdBuf *cb = cb_of(A(0));
+    uint32_t n = (uint32_t)A(1);
+    uint64_t handles[64];
+    if (n > 64) n = 64;
+    memcpy(handles, AP(2), n * 8);  // (rec may call into the guest)
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t p = handles[i];
+        for (int guard = 0; p && guard < 1000000; guard++) {
+            const CmdRec *src = (const CmdRec *)(uintptr_t)p;
+            if (src->op == CMD_END) break;
+            if (src->op == CMD_JUMP) { p = src->x[0]; continue; }
+            uint32_t size = src->size, op = src->op;
+            CmdRec *dst = rec(c, cb, op, size - (uint32_t)sizeof(CmdRec));
+            memcpy(dst, (const void *)(uintptr_t)p, size);
+            p += size;
+        }
+    }
+}
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerStatic) { (void)c; }

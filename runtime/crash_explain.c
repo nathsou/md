@@ -63,7 +63,7 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
     char head[160], what[400];
     if (rt_romfs_files >= 0 && rt_romfs_files < ROMFS_FILES) {
         snprintf(head, sizeof head, "Your game files are incomplete");
-        snprintf(what, sizeof what, "Dread Recomp found %d of the game's %d files, and the game stopped when it needed "
+        snprintf(what, sizeof what, "nx found %d of the game's %d files, and the game stopped when it needed "
                  "one that's missing. Copy your game files again so none are missing, then set them up again on the "
                  "start screen (Game Files).", rt_romfs_files, (int)ROMFS_FILES);
     } else if (has("doesn't fit its language")) {
@@ -72,37 +72,37 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
                  "patch), and the game stopped at a question it can't show that way. Set up unmodified game files on "
                  "the start screen (Game Files). To play in another language, pick it in Settings (Language).");
     } else if (has("built for another version")) {
-        snprintf(head, sizeof head, "The game code was built for other game files or another version of Dread Recomp");
-        snprintf(what, sizeof what, "Start Dread Recomp again: the start screen rebuilds the game code for these game "
+        snprintf(head, sizeof head, "The game code was built for other game files or another version of nx");
+        snprintf(what, sizeof what, "Start nx again: the start screen rebuilds the game code for these game "
                  "files by itself.");
     } else if (has("unsupported version of the game")) {
         snprintf(head, sizeof head, "Wrong version of the game");
-        snprintf(what, sizeof what, "Dread Recomp needs version 1.0.0, 1.0.1 or 1.1.0 of the game. Set up those game "
+        snprintf(what, sizeof what, "nx needs version 1.0.0, 1.0.1 or 1.1.0 of the game. Set up those game "
                  "files on the start screen (Game Files).");
     } else if (has("no font for the game's text")) {
         snprintf(head, sizeof head, "No font for the game's text");
-        snprintf(what, sizeof what, "Import the Switch fonts in Settings (Game font), or reinstall Dread Recomp - it "
+        snprintf(what, sizeof what, "Import the Switch fonts in Settings (Game font), or reinstall nx - it "
                  "comes with a font of its own.");
     } else if (has("get_terminate") || has("uncaught C++ exception")) {  // (the game threw: recompiled code can't
                                                                          // unwind; runtime/hle/warp.c rt_cxa_throw)
         snprintf(head, sizeof head, "The game ran into an error it couldn't recover from");
-        snprintf(what, sizeof what, "This is a bug in Dread Recomp, not a problem with your game files or PC. %s", report);
+        snprintf(what, sizeof what, "This is a bug in nx, not a problem with your game files or PC. %s", report);
     } else if (in_gpu_driver(g_pc)) {
         snprintf(head, sizeof head, "Your graphics driver crashed");
         snprintf(what, sizeof what, "Update your graphics driver (NVIDIA, AMD or Intel) and try again. If it keeps "
                  "happening, please report it with the log file below.");
     } else if (has("VK_") || has("Vulkan")) {
         snprintf(head, sizeof head, "Graphics driver error");
-        snprintf(what, sizeof what, "Dread Recomp needs a graphics driver with Vulkan 1.3: install the latest driver for "
+        snprintf(what, sizeof what, "nx needs a graphics driver with Vulkan 1.3: install the latest driver for "
                  "your GPU (NVIDIA, AMD or Intel). If it keeps happening, please report it with the log file below.");
     } else if (has("out of memory") || has("cannot allocate") || has("alloc failed")) {
         snprintf(head, sizeof head, "Out of memory");
         snprintf(what, sizeof what, "Close other programs and try again.");
     } else if (g_pc && rt_host_fn_name(g_pc, NULL)) {
         snprintf(head, sizeof head, "The game crashed");
-        snprintf(what, sizeof what, "This is a bug in Dread Recomp, not a problem with your game files or PC. %s", report);
+        snprintf(what, sizeof what, "This is a bug in nx, not a problem with your game files or PC. %s", report);
     } else {
-        snprintf(head, sizeof head, "Dread Recomp stopped because of an error");
+        snprintf(head, sizeof head, "nx stopped because of an error");
         snprintf(what, sizeof what, "%s", report);
     }
     fprintf(stderr, "[crash] %s\n", head);

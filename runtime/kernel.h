@@ -28,7 +28,8 @@ struct KThread {
 #endif
     uint64_t entry, tlr, id;
     uint32_t handle;
-    int prio, core;
+    int prio, core;        // core: its ideal core (SetThreadCoreMask)
+    uint64_t affinity;     // the cores it may run on (bit mask)
     bool cancel, in_sync_wait;
     volatile bool sleeping;  // in SleepThread (kernel_yield_to_urgent: not runnable)
     bool is_main;  // the process's main thread (kernel_create_main_thread)
@@ -47,6 +48,17 @@ struct KThread {
     uint64_t wait_since;
     uint64_t sync_handles;
     int32_t sync_count;
+    // Start order (kernel.c thread_main): a thread started on its creator's core with no more urgency waits for the
+    // creator to block. block_seq counts this thread's blocking calls; start_after / start_seq: whose, and from when.
+    volatile uint32_t block_seq;
+    KThread *start_after;
+    uint32_t start_seq;
+    // Per-core scheduling (kernel.c sched_*): the core this thread holds (-1: none), its place in the core's queue,
+    // and requests for its next safe point - give the core to a more urgent thread, take it back after blocking
+    int sched_core;
+    uint64_t sched_ticket;
+    volatile bool sched_preempt;
+    bool sched_resched, sched_waiting;
 };
 
 typedef struct KSharedMem {

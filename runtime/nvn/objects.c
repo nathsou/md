@@ -15,7 +15,7 @@ static uint64_t next_debug_id = 1;
 // NVNdeviceInfo -> value
 static uint32_t device_integer(uint32_t which) {
     static const uint32_t v[] = {
-        [0] = 53, [1] = 207,           // API version
+        [0] = 53, [1] = 400,           // API version (games check major == 53, minor >= their SDK's: ACNH 312)
         [2] = 14, [3] = 65536, [4] = 256, [5] = 8, [6] = 16, [7] = 4, [8] = 16, [9] = 32,
         [10] = 16, [11] = 4, [12] = 4, [13] = 4, [14] = 16, [15] = 32, [16] = 32,
         [17] = 256, [18] = 256,        // reserved texture / sampler descriptors
@@ -261,11 +261,35 @@ NVN(nvnMemoryPoolBuilderGetSize) { RET(G(uint64_t, A(0), 0x18)); }
 
 static NvnPool pools[256];
 static int npools;
+
+// Virtual pools (flag VIRTUAL 0x200: no storage of their own; the GPU sees them where physical pools are mapped, with
+// nvnMemoryPoolMapVirtual) get memory of their own in the virtual pools' range (rt.h VPOOL_BASE), which the renderer's
+// GPU range covers: their addresses are known at once, as on the Switch, and resources placed in them read and write
+// that memory. The physical pools behind them are never seen by the GPU here (their pages aren't aliased): fine as
+// long as a page isn't mapped at two places or moved between them (MapVirtual logs those).
+static uint64_t vpool_next = VPOOL_BASE;
+RT_ON_RESET(vpool_reset) { vpool_next = VPOOL_BASE; }
+static uint64_t vpool_alloc(uint64_t size) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    size = (size + 0xFFFF) & ~0xFFFFull;
+    pthread_mutex_lock(&m);
+    uint64_t a = vpool_next;
+    if (a + size > VPOOL_BASE + VPOOL_SIZE) FATAL("nvn: virtual memory pools need more than %llu MB\n", (unsigned long long)(VPOOL_SIZE >> 20));
+    vpool_next += size;
+    pthread_mutex_unlock(&m);
+    plat_commit(a, size);
+    return a;
+}
+
 NVN(nvnMemoryPoolInitialize) {
     NvnPool *p = calloc(1, sizeof *p);
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
+    if ((p->flags & 0x200) && !p->storage) {
+        p->storage = vpool_alloc(p->size);
+        LOG("[nvn] virtual memory pool: %llu MB at %#llx\n", (unsigned long long)(p->size >> 20), (unsigned long long)p->storage);
+    }
     SET_HOST(A(0), p);
     if (getenv("LARECOMP_LOG_BINDS")) LOG("[pool] %llx + %llu KB flags %#x\n", (unsigned long long)p->storage, (unsigned long long)(p->size >> 10), p->flags);
     if (npools < 256) pools[npools++] = *p;  // (debug: nvn_pool_flags_at)
@@ -289,7 +313,17 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
-NVN(nvnMemoryPoolMapVirtual) { RET(1); }
+// bool MapVirtual(virtual pool, int count, const NVNmappingRequest *requests): {physical pool, physical offset, virtual
+// offset, size, storage class} (0x28 bytes each). The virtual pool has memory of its own (vpool_alloc): accepted.
+NVN(nvnMemoryPoolMapVirtual) {
+    static int nlog;
+    const uint8_t *r = (const uint8_t *)AP(2);
+    for (int i = 0; i < (int)A(1) && nlog < 16; i++, nlog++)
+        LOG("[nvn] MapVirtual %#llx: physical +%#llx -> virtual +%#llx size %#llx\n", (unsigned long long)A(0),
+            (unsigned long long)*(uint64_t *)(r + i * 0x28 + 8), (unsigned long long)*(uint64_t *)(r + i * 0x28 + 0x10),
+            (unsigned long long)*(uint64_t *)(r + i * 0x28 + 0x18));
+    RET(1);
+}
 
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
@@ -527,6 +561,9 @@ NVN(nvnTextureWriteTexels) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     const int32_t *r = AP(2);  // xoffset, yoffset, zoffset, width, height, depth
     LevelLayout l = tegra_level(&t->layout, 0);
+    if (getenv("LARECOMP_LOG_TEXELS") && r)
+        LOG("[texels] %s t%u %ux%ux%u fmt %#x @%#llx region %d,%d,%d %dx%dx%d\n", t->label, t->target, t->width, t->height,
+            t->depth, t->format, (unsigned long long)t->addr, r[0], r[1], r[2], r[3], r[4], r[5]);
     if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
         tegra_swizzle(AP(3), (uint8_t *)(uintptr_t)t->addr + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
                       t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
@@ -810,6 +847,10 @@ NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2
 NVN(nvnWindowGetCrop) { memcpy(AP(1), WIN->crop, 16); }
 NVN(nvnWindowAcquireTexture) {
     NvnWindow *w = WIN;
+    if (getenv("LARECOMP_LOG_PRESENT")) {
+        static int n;
+        if (n++ % 120 < 3) LOG("[window] acquire -> %d of %d (active %d)\n", w->next, w->num, w->active);
+    }
     if (A(1)) sync_of(A(1))->signaled = 1;
     *(int32_t *)AP(2) = w->next;
     w->next = (w->next + 1) % (w->active ? w->active : 1);
@@ -821,9 +862,17 @@ NVN(nvnQueueAcquireTexture) {
     w->next = (w->next + 1) % (w->active ? w->active : 1);
     RET(0);
 }
+volatile uint64_t g_nvn_presents;  // presents so far (cmdbuf.c's list origins, debug)
 NVN(nvnQueuePresentTexture) {
+    g_nvn_presents++;
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
+    if (getenv("LARECOMP_LOG_PRESENT")) {
+        static int n;
+        if (n++ % 120 < 3)
+            for (int k = 0; k < w->num; k++)
+                LOG("[window] present %d: texture %d at %#llx%s\n", i, k, (unsigned long long)HOST(NvnTexture, w->textures[k])->addr, k == i ? " <-" : "");
+    }
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
 }
 

@@ -1,10 +1,11 @@
-// Dread Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
+// Entry: identify the game, load its modules and recompiled code, set up the kernel, run nn::init::Start on the main
+// thread.
 #include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "game_addresses.h"
+#include "game.h"
 #include "gamelib.h"
 #include "paths.h"
 #include "settings.h"
@@ -12,6 +13,12 @@
 #include "kernel.h"
 
 const char *g_romfs_dir;
+
+const char *rt_window_title(void) {
+    static char t[160];
+    snprintf(t, sizeof t, g_game.name[0] ? "nx - %s" : "nx", g_game.name);
+    return t;
+}
 
 // rtld normally passes these to nn::init::Start: run every module's init/fini arrays.
 static void run_array(Cpu *c, uint64_t arr, uint64_t size) {
@@ -21,9 +28,10 @@ static void run_array(Cpu *c, uint64_t arr, uint64_t size) {
     }
 }
 
-// nn::init::Start (SDK 11: three callbacks) calls x2 right after nnosInitialize, x3 after nninitStartup just before
-// nnMain, and x4 after nnMain returns: SDK constructors run early, the game's once nninitStartup has set up its heap,
-// and the modules' fini arrays at the end.
+// nn::init::Start takes the callbacks rtld would pass. SDK 11 (three): x2 right after nnosInitialize, x3 after
+// nninitStartup just before nnMain, and x4 after nnMain returns - SDK constructors run early, the game's once
+// nninitStartup has set up its heap, and the modules' fini arrays at the end. Older SDKs (9: two): x2 right after
+// nnosInitialize runs every module's constructors, x3 the fini arrays after nnMain.
 // rtld runs a module's DT_INIT, which registers it (and its TLS template) with musl via
 // __nnmusl_init_dso and then runs its init_array; fall back to the array if there is no DT_INIT.
 static void module_init(Cpu *c, Module *m) {
@@ -32,10 +40,14 @@ static void module_init(Cpu *c, Module *m) {
     else run_array(c, m->init_array, m->init_array_sz);
 }
 
-static void rtld_init_sdk(Cpu *c) {  // the SDK, then the subsdks (built on it)
-    for (int i = 1; i < g_nmodules; i++) module_init(c, &g_modules[i]);
+static void rtld_init_sdk(Cpu *c) {  // the SDK, then the subsdks (built on it), in load order
+    Module *sdk = loader_module("sdk");
+    if (sdk) module_init(c, sdk);
+    for (int i = 1; i < g_nmodules; i++)
+        if (&g_modules[i] != sdk) module_init(c, &g_modules[i]);
 }
 static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
+static void rtld_init_all(Cpu *c) { rtld_init_sdk(c); rtld_init_main(c); }
 static void rtld_fini(Cpu *c) {
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
@@ -159,7 +171,7 @@ static void boot(const char *root) {
     }
 #endif
     char why[512];
-    if (!game_version_select(root, why, sizeof why)) FATAL("%s\n", why);  // (the address table: game_addresses.h)
+    if (!game_select(root, why, sizeof why)) FATAL("%s\n", why);  // (its profile, if any: game.h)
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
@@ -167,27 +179,35 @@ static void boot(const char *root) {
     dispatch_init();
 
     uint32_t stack_size = 0x100000;
-    int prio = 44;
+    int prio = 44, core = 0;
     FILE *f = fopen(npdm_path, "rb");
     if (f) {
         uint8_t meta[0x80];
         if (fread(meta, 1, sizeof meta, f) == sizeof meta && !memcmp(meta, "META", 4)) {
             prio = meta[0xE];
+            core = meta[0xF];
             stack_size = *(uint32_t *)(meta + 0x1C);
         }
         fclose(f);
     }
-    LOG("main thread: prio %d, stack 0x%x\n", prio, stack_size);
+    LOG("main thread: prio %d, core %d, stack 0x%x\n", prio, core, stack_size);
 
-    uint64_t start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");  // (SDK 11)
-    if (!start) start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_");  // (older SDKs: two callbacks)
-    if (!start) FATAL("nn::init::Start not found\n");
-    uint64_t init_sdk = hle_register("<rtld_init_sdk>", rtld_init_sdk);
-    uint64_t init_main = hle_register("<rtld_init_main>", rtld_init_main);
+    if (g_game.profile && g_game.profile->booted) g_game.profile->booted();
+    if (getenv("LARECOMP_WATCH_EARLY")) { extern void watch_arm(void); watch_arm(); }  // (debug: the watch from boot)
     uint64_t fini = hle_register("<rtld_fini>", rtld_fini);
-    KThread *t = kernel_create_main_thread(start, stack_size, prio);
-    // nn::init::Start(thread_handle, args_region, init_sdk, init_main, fini)
-    kernel_run_main(t, t->handle, 0, init_sdk, init_main, fini);
+    uint64_t start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");  // (SDK 11)
+    KThread *t;
+    if (start) {
+        uint64_t init_sdk = hle_register("<rtld_init_sdk>", rtld_init_sdk);
+        uint64_t init_main = hle_register("<rtld_init_main>", rtld_init_main);
+        t = kernel_create_main_thread(start, stack_size, prio, core);
+        // nn::init::Start(thread_handle, args_region, init_sdk, init_main, fini)
+        kernel_run_main(t, t->handle, 0, init_sdk, init_main, fini);
+    } else if ((start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_"))) {  // (older SDKs: two callbacks)
+        uint64_t init_all = hle_register("<rtld_init_all>", rtld_init_all);
+        t = kernel_create_main_thread(start, stack_size, prio, core);
+        kernel_run_main(t, t->handle, 0, init_all, fini, 0);
+    } else FATAL("nn::init::Start not found\n");
 }
 
 // The log's first line after the log's own: this build and the machine, for bug reports. Nothing that identifies the
@@ -209,7 +229,7 @@ static void log_startup_info(void) {
     char ram[32] = "RAM unknown";
     if (si.ram && tenths % 10) snprintf(ram, sizeof ram, "%llu.%llu GB RAM", tenths / 10, tenths % 10);
     else if (si.ram) snprintf(ram, sizeof ram, "%llu GB RAM", tenths / 10);
-    fprintf(stderr, "[info] Dread Recomp %s, %s, %s%s, %s%s%s\n", larecomp_version(), si.os[0] ? si.os : "unknown OS",
+    fprintf(stderr, "[info] nx %s, %s, %s%s, %s%s%s\n", larecomp_version(), si.os[0] ? si.os : "unknown OS",
             si.cpu[0] ? si.cpu : "unknown CPU", cores, ram, si.package ? ", " : "", si.package ? si.package : "");
 }
 

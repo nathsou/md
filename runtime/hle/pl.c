@@ -275,7 +275,7 @@ static void load_fonts(void) {
     if (!fonts[F_STD].addr && rt_resource("DejaVuSans.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf", bundled, sizeof bundled))
         load_one_checked(bundled, &fonts[F_STD], true);
     if (!fonts[F_STD].addr)  // (only a broken install: the app ships DejaVu Sans)
-        FATAL("no font for the game's text: import the Switch fonts in Settings (Game font), or reinstall Dread Recomp\n");
+        FATAL("no font for the game's text: import the Switch fonts in Settings (Game font), or reinstall nx\n");
 }
 
 // SharedFontType: 0 Standard, 1 ChineseSimple, 2 ChineseSimpleExt, 3 ChineseTraditional, 4 Korean, 5 NintendoExt
@@ -289,3 +289,38 @@ static const Font *font_for(uint64_t type) {
 HLE_FUNC("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", pl_get_load_state) { c->x[0] = 1; }
 HLE_FUNC("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", pl_get_address) { c->x[0] = font_for(c->x[0])->addr; }
 HLE_FUNC("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", pl_get_size) { c->x[0] = font_for(c->x[0])->size; }
+HLE_FUNC("_ZN2nn2pl21RequestSharedFontLoadENS0_14SharedFontTypeE", pl_request_load) { (void)c; }
+
+// Every type, Standard first (the order the console gives for the European / American / Japanese languages)
+// Result GetSharedFont(int *count, SharedFontData *out, int max, LanguageCode): SharedFontData {type, address, size}
+HLE_FUNC("_ZN2nn2pl13GetSharedFontEPiPNS0_14SharedFontDataEiNS_8settings12LanguageCodeE", pl_get_shared_font) {
+    int32_t *count = (int32_t *)(uintptr_t)c->x[0];
+    uint8_t *out = (uint8_t *)(uintptr_t)c->x[1];
+    int max = (int)c->x[2], n = 0;
+    for (int t = 0; t < N_FONT_TYPES && n < max; t++, n++) {
+        const Font *f = font_for((uint64_t)t);
+        *(uint32_t *)(out + n * 24) = (uint32_t)t;
+        *(uint64_t *)(out + n * 24 + 8) = f->addr;
+        *(uint64_t *)(out + n * 24 + 16) = f->size;
+    }
+    if (count) *count = n;
+    c->x[0] = 0;
+}
+
+// Result GetSharedFontInOrderOfPriority(int *count, SharedFontType *types, const void **addrs, size_t *sizes, int max,
+// LanguageCode)
+HLE_FUNC("_ZN2nn2pl30GetSharedFontInOrderOfPriorityEPiPNS0_14SharedFontTypeEPPKvPmiNS_8settings12LanguageCodeE",
+         pl_get_in_order) {
+    int32_t *count = (int32_t *)(uintptr_t)c->x[0];
+    uint32_t *types = (uint32_t *)(uintptr_t)c->x[1];
+    uint64_t *addrs = (uint64_t *)(uintptr_t)c->x[2], *sizes = (uint64_t *)(uintptr_t)c->x[3];
+    int max = (int)c->x[4], n = 0;
+    for (int t = 0; t < N_FONT_TYPES && n < max; t++, n++) {
+        const Font *f = font_for((uint64_t)t);
+        if (types) types[n] = (uint32_t)t;
+        if (addrs) addrs[n] = f->addr;
+        if (sizes) sizes[n] = f->size;
+    }
+    if (count) *count = n;
+    c->x[0] = 0;
+}

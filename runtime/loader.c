@@ -2,9 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gamelib.h"
 #include "rt.h"
 
-Module g_modules[4];
+Module g_modules[MAX_MODULES];
 int g_nmodules;
 
 enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
@@ -92,7 +93,7 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
         case DT_FINI_ARRAYSZ: m->fini_array_sz = d[1]; break;
         }
     }
-    LOG("loaded %-5s at %llx size %llx syms %llu\n", m->name, base, size, m->nsyms);
+    LOG("loaded %-8s at %llx size %llx syms %llu\n", m->name, base, size, m->nsyms);
 }
 
 static Elf64Sym *sym(Module *m, uint64_t i) { return (Elf64Sym *)m->symtab + i; }
@@ -162,31 +163,36 @@ static void relocate(Module *m) {
             case R_JUMP_SLOT: {
                 uint64_t s = resolve(m, si);
                 *where = s ? s + r[i].addend : 0;
-                if (s >= HLE_BASE && s < HLE_BASE + HLE_SIZE) unresolved++;
+                if (s >= HLE_BASE && s < HLE_BASE + HLE_SIZE && !hle_lookup_impl(symname(m, sym(m, si)))) {
+                    unresolved++;
+                    if (getenv("LARECOMP_LOG_IMPORTS")) LOG("[loader] %s: %s has no definition: bound to a host stub\n", m->name, symname(m, sym(m, si)));
+                }
                 break;
             }
             default: FATAL("%s: reloc type %u\n", m->name, type);
             }
         }
     }
-    LOG("relocated %-5s (%d imports bound to host stubs)\n", m->name, unresolved);
+    LOG("relocated %-8s (%d imports bound to host stubs)\n", m->name, unresolved);
 }
 
+// The modules the game code library was generated for (tools/gen_game.py), at its addresses: main, subsdk*, sdk.
+// Symbols resolve in that order, as rtld's load order.
 void loader_load(const char *exefs) {
     char path[1024];
-    // (symbols resolve in this order: main, sdk, subsdk0 - as rtld's load order for imports the SDK provides)
-    static const struct { const char *name; uint64_t base; bool optional; } mods[] = {
-        {"main", MAIN_BASE, false}, {"sdk", SDK_BASE, false}, {"subsdk0", SUBSDK0_BASE, true}};
-    for (unsigned i = 0; i < sizeof mods / sizeof *mods; i++) {
-        snprintf(path, sizeof path, "%s/%s", exefs, mods[i].name);
-        if (mods[i].optional) {
-            FILE *f = fopen(path, "rb");
-            if (!f) continue;
-            fclose(f);
-        }
+    const GameLibTables *g = gamelib_tables();
+    for (uint32_t i = 0; i < g->nmodules && g_nmodules < MAX_MODULES; i++) {
+        snprintf(path, sizeof path, "%s/%s", exefs, g->modules[i].name);
         Module *m = &g_modules[g_nmodules++];
-        m->name = mods[i].name;
-        load_nso(m, path, mods[i].base);
+        m->name = g->modules[i].name;
+        load_nso(m, path, g->modules[i].base);
+        if (m->size > g->modules[i].size + 0x4000) FATAL("%s: larger than the game code was generated for\n", m->name);
     }
     for (int i = 0; i < g_nmodules; i++) relocate(&g_modules[i]);
+}
+
+Module *loader_module(const char *name) {
+    for (int i = 0; i < g_nmodules; i++)
+        if (!strcmp(g_modules[i].name, name)) return &g_modules[i];
+    return NULL;
 }

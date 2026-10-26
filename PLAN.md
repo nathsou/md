@@ -1,4 +1,8 @@
-# Metroid Dread static recompilation: plan
+# nx: plan
+
+nx started as a static recompilation of Metroid Dread (sections 0 to 6 below, written for it) and became an engine
+for several games. Section 7 covers the multi-game layout, Animal Crossing: New Horizons, game updates and shader
+prebuilding.
 
 Goal: run *Metroid Dread* (Switch, 2021) natively on macOS (Apple Silicon, Metal) and Linux (Vulkan), then
 Windows (Vulkan), by statically recompiling the game's AArch64 code to C and replacing the Switch OS, GPU API,
@@ -317,3 +321,70 @@ Each phase has an exit test. The phases are rough, not dated; graphics will take
    cheapest way to find out how far the existing lifter gets.
 3. Write an MSHD parser and dump shader-corpus statistics, then run LASRecomp's `translate.c` over every shader.
 4. Decide fork versus vendored core with upstream in mind, then start phase 0.
+
+## 7. Several games (nx)
+
+### Layout
+- `build/nx` is the app, shared by every game; each game's recompiled code is its own library
+  (`build/<name>/game.dylib`, from `data/<name>/exefs` through `generated/<name>/`). The app scans `build/*/` for the
+  library whose id matches the game files' main build ID, so several games and versions sit side by side.
+- `games/<id>/` profiles (runtime/game.h): versions by main build ID, per-version address tables
+  (`patches_<v>.h` for the generator, `runtime_<v>.h` for the runtime only), hooks, boot fixes and `flags`, the engine
+  behaviours a game opts into (`GAME_CLEAR_SCREEN_TARGETS`: Dread's per-frame clear of screen-sized targets, which
+  breaks ACNH's lazy clears). Saves, settings keys and shader caches are keyed by the profile id (`save/<id>/`,
+  `cache/<id>/`).
+- A game without a profile still boots: title ID from `main.npdm`, no patches.
+
+### Animal Crossing: New Horizons (1.0.0, 2.0.7)
+Engine fixes it needed, all shared:
+- **Conditional rendering** (`nvnCommandBufferSetRenderEnableConditional`): agl's lazy clears depend on it. The
+  counter pair at the address decides (mode 0 renders if equal, 1 if not). A cell starts armed and the counter report
+  after the first clear disarms it for good: re-arming it each frame (an early guess) cleared targets the game keeps
+  between frames, and the opening movie flickered black on frames without a new video frame.
+- `nvnCommandBufferClearBuffer` and `nvnCommandBufferReportValue` were recorded but never executed; both write
+  guest memory in command order now.
+- **3D render targets**: the colour-grading LUT is drawn slice by slice (`depthPlane`), and such draws compile their
+  program synchronously (an async-skipped LUT draw left the tonemap black).
+- **FMZ** (`FMUL.FMZ`/`FFMA.FMZ`: 0 * anything = 0) and NaN texture coordinates sampling as 0 (Metal samples the far
+  edge: a white sky).
+- **Vertex streams with a stride that isn't a multiple of 4** (bone indices, 1 byte) are repacked: Metal can't read
+  them, which had given spiky black geometry everywhere.
+- HID touch screen, keyboard, mouse, debug pad and six-axis state reads (their shared-memory LIFOs overflowed: heap
+  corruption at the name entry).
+- The movie decoder decodes audio (Vorbis, Opus), writes into the game's own output buffers, and calls the guest
+  outside its lock (4 s stalls).
+- Time: `IStaticService` 400/401 (clock snapshots), `LARECOMP_TIME_OFFSET`.
+
+### Generator
+- Jump tables whose bounds check sits far above the `br` (compilers schedule the per-case register setup in between:
+  29 instructions in ACNH 2.0.7) are found within `JT_WINDOW` (48) straight-line instructions instead of 16. Before,
+  such a `br` fell back to the function dispatch and stopped the game at boot ("no function at ...").
+
+### Updates
+`extract.mts --update <update.nsp>` takes the update's exefs and applies its romfs patch: the BKTR section, an
+indirect storage mapping the patched romfs onto the base romfs and the update's own data, that data AES-CTR-Ex
+encrypted with a per-subsection generation in the counter. A new version needs a `GA_VERSION` line and its address
+tables; addresses were ported by matching masked instruction windows around each 1.0.0 site (Dread 2.1.0's moved
+by 0x490).
+
+### Shader prebuilding
+- Pipeline variants (`ShaderRec`: the shader pair's hashes, a 0x100-byte prefix hash and two constants to locate
+  them, and the render state Metal compiles in) are recorded with `LARECOMP_RECORD_KEYS` into
+  `games/<id>/shader_variants.txt`, which ships (hashes only, no game code).
+- At startup the runtime indexes the shader containers in the player's romfs (`.bfsha`, `.bnsh`, `.ptcl`, `.arc`,
+  `.sarc`/`.pack`/`.szs`/`.zs` contents; cached per version in `cache/<id>/shader_index-<build ID>.txt`), finds each
+  listed variant's code by prefix hash then full hash, and builds the pipelines on background threads. Measured:
+  Dread 376 variants in 0.5 s; ACNH 408 in 0.4 s cached (the first index of its 100,000 files: ~60 s from an external
+  disk). 28 of ACNH's recorded stages aren't found in the files as stored (nested archives or code patched in
+  memory): they compile on first use.
+- `make corpus` found a translator bug: texel offsets on 3D lookups were 2-component (now x, y, z). ACNH's corpus
+  (9,558 stages) leaves 7 agl debug shaders untranslated: TLDS type 6 (multisample fetch) and TLD4 with per-texel
+  offsets.
+- `make corpus` also builds them into a read-only Metal binary archive, one per version
+  (`cache/<id>/shaders-<build ID>.metalarchive`, tagged with the translator, GPU and macOS build), which later
+  launches load. It is built whole each time: Metal (macOS 27) can't save an archive it loaded and added to
+  ("expecting 'fragment' stage in pipeline no. N").
+
+### Dumps that could not be supported
+Pikmin 2 (a RAR holding 940 MB of a 1.1 GB NSP) and Metroid Prime Remastered (an NSP missing its last 14.5 MB,
+which hold most of its exefs) are incomplete downloads: their game code isn't there. `extract.mts` now says so.

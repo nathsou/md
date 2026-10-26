@@ -1,21 +1,21 @@
-// Hook points: instructions of the game's code that call into the runtime (tools/patches.py HOOKS). The generated
-// code at a hook site runs `rt_hook(c, site)` first; what a hook does lives here, so changing it rebuilds the app,
-// not the game code.
+// Metroid Dread's hook points: instructions of its code that call into the runtime (games/dread/patches.py HOOKS).
+// The generated code at a hook site runs `rt_hook(c, site)` first (runtime/game.c hands it to dread_hook); what a
+// hook does lives here, so changing it rebuilds the app, not the game code.
 //
-// rt_hook returns 0: run the site's own instruction, 1: the hook did it all, 2..: jump to the site's targets
+// dread_hook returns 0: run the site's own instruction, 1: the hook did it all, 2..: jump to the site's targets
 // (HOOKS[site][1], in order).
-#include "../game_addresses.h"
+#include "dread.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "../cpu.h"
-#include "../rt.h"
+#include "cpu.h"
+#include "rt.h"
 
-// The hook sites (game_addresses.h): which one a site is, by the selected game version's table. None yet for Dread:
-// add X(NAME_SITE) here, the address to game_addresses/patches_<version>.h and the site to tools/patches.py HOOKS.
+// The hook sites: which one a site is, by the running version's table. A new one: X(NAME_SITE) here, the address in
+// patches_<version>.h and the site in patches.py HOOKS.
 #define HOOK_SITES(X) \
     X(MOVIE_LINK_GATE_SITE) \
     X(MOVIE_UNLINK_GATE_SITE) \
@@ -29,14 +29,14 @@ enum {
     H_COUNT
 };
 static const size_t hook_field[H_COUNT + 1] = {
-#define X(name) offsetof(GameAddrs, name),
+#define X(name) offsetof(DreadAddrs, name),
     HOOK_SITES(X)
 #undef X
 };
 
 static int hook_id(uint64_t site) {
     for (size_t i = 0; i < H_COUNT; i++)
-        if (*(const uint64_t *)((const char *)g_ga + hook_field[i]) == site) return (int)i;
+        if (*(const uint64_t *)((const char *)game_addrs() + hook_field[i]) == site) return (int)i;
     return -1;
 }
 
@@ -62,7 +62,7 @@ static void movie_ring_wait(uint64_t dispatcher) {
     kernel_yield_to_urgent(50000000ull);
 }
 
-int rt_hook(Cpu *c, uint64_t site) {
+int dread_hook(Cpu *c, uint64_t site) {
     switch (hook_id(site)) {
     case H_MOVIE_LINK_GATE_SITE:
     case H_MOVIE_UNLINK_GATE_SITE:

@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../game_addresses.h"
 #include "../rt.h"
 #include "pace.h"
 #include "slowframe.h"

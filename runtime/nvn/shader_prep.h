@@ -43,7 +43,15 @@ typedef struct {
     uint8_t topo;            // primitive class: 0 points, 1 lines, 2 triangles
     uint8_t poly_fill;       // filled polygons (0: lines)
     uint32_t local[3];       // compute: local size
+    // where to find each stage's code in the game files when no shader container describes it: the hash of its first
+    // SHADER_PREFIX bytes, and its constants' offset / size (the code's length is their end) - 0: unknown
+    uint64_t vpre, fpre;
+    uint32_t vconst[2], fconst[2];
 } ShaderRec;
+#define SHADER_PREFIX 0x100
+struct NvnShaderStage;
+// (the recorder) a stage's prefix hash and constants into the record's fields
+void shader_rec_locate(const struct NvnShaderStage *s, uint64_t *pre, uint32_t cons[2]);
 
 // The record's text form (one line, no newline) and back
 void shader_rec_format(const ShaderRec *r, char *out, size_t n);

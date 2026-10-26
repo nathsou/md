@@ -174,6 +174,11 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
             if (!target) { LOG("[ipc] domain object %u missing\n", req.domain_obj); return 0xE401; }
         }
         target->handler(target, &req, &resp);
+        static int log_ipc = -1;  // LARECOMP_LOG_IPC=1 (debugging): every request and its result
+        if (log_ipc < 0) log_ipc = getenv("LARECOMP_LOG_IPC") != NULL;
+        if (log_ipc && strcmp(target->name, "audren:IAudioRenderer"))
+            LOG("[ipc] %s cmd %u -> %#x (%u bytes out, %d objects, %d handles)\n", target->name, req.cmd, resp.result,
+                resp.data_size, resp.nobjects, resp.ncopy + resp.nmove);
     } else if (req.type == 5 || req.type == 7) {  // control
         req.cmd = *(uint32_t *)(payload + 8);
         LOG("[ipc] control %u on %s (handle %x)\n", req.cmd, sess->svc->name, handle);

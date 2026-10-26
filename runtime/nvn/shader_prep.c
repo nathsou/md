@@ -8,9 +8,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+
+#include <zstd.h>
 
 #include "nvn.h"
 #include "shader_prep.h"
+#include "game.h"
+#include "yaz0.h"
 
 uint64_t shader_code_hash(const uint8_t *code, size_t n) {  // FNV-1a, 64-bit
     uint64_t h = 0xcbf29ce484222325ull;
@@ -21,6 +26,13 @@ uint64_t shader_code_hash(const uint8_t *code, size_t n) {  // FNV-1a, 64-bit
 uint64_t shader_stage_hash(const struct NvnShaderStage *s) {
     if (!s->code_addr || !s->const_offset) return 0;
     return shader_code_hash((const uint8_t *)(uintptr_t)s->code_addr, (size_t)s->const_offset + s->const_size);
+}
+
+void shader_rec_locate(const struct NvnShaderStage *s, uint64_t *pre, uint32_t cons[2]) {
+    *pre = 0, cons[0] = cons[1] = 0;
+    if (!s->code_addr || !s->const_offset || s->const_offset + s->const_size < SHADER_PREFIX) return;
+    *pre = shader_code_hash((const uint8_t *)(uintptr_t)s->code_addr, SHADER_PREFIX);
+    cons[0] = s->const_offset, cons[1] = s->const_size;
 }
 
 // ------------------------------------------------------------------ stale-program detector (shader_prep.h)
@@ -68,6 +80,7 @@ void shader_rec_format(const ShaderRec *r, char *out, size_t n) {
 #define PUT(...) do { if (o < n) o += (size_t)snprintf(out + o, n - o, __VA_ARGS__); } while (0)
     if (r->kind == 'C') {
         PUT("C cs=%016" PRIx64 " l=%u,%u,%u", r->vs, r->local[0], r->local[1], r->local[2]);
+        if (r->vpre) PUT(" cp=%016" PRIx64 " cc=%x/%x", r->vpre, r->vconst[0], r->vconst[1]);
         return;
     }
     PUT("G vs=%016" PRIx64 " fs=%016" PRIx64 " f=%x a=", r->vs, r->fs, r->flags);
@@ -88,6 +101,9 @@ void shader_rec_format(const ShaderRec *r, char *out, size_t n) {
         for (int k = 0; k < 8; k++) PUT("%02x", r->blend[i][k]);
     }
     PUT(" k=%u t=%u p=%u", r->a2c, r->topo, r->poly_fill);
+    if (r->vpre && r->fpre)
+        PUT(" vp=%016" PRIx64 " vc=%x/%x fp=%016" PRIx64 " fc=%x/%x", r->vpre, r->vconst[0], r->vconst[1], r->fpre,
+            r->fconst[0], r->fconst[1]);
 #undef PUT
 }
 
@@ -125,6 +141,8 @@ bool shader_rec_parse(const char *line, ShaderRec *r) {
             if (e == v) return false;
             v = *e == ',' ? e + 1 : e;
         }
+        if ((v = field(line, "cp"))) r->vpre = strtoull(v, NULL, 16);
+        if ((v = field(line, "cc"))) sscanf(v, "%x/%x", &r->vconst[0], &r->vconst[1]);
         return r->vs != 0;
     }
     if (!(v = field(line, "vs"))) return false;
@@ -174,6 +192,10 @@ bool shader_rec_parse(const char *line, ShaderRec *r) {
     if ((v = field(line, "k"))) r->a2c = (uint8_t)strtoul(v, NULL, 16);
     r->topo = (v = field(line, "t")) ? (uint8_t)strtoul(v, NULL, 16) : 2;
     r->poly_fill = (v = field(line, "p")) ? (uint8_t)strtoul(v, NULL, 16) : 1;
+    if ((v = field(line, "vp"))) r->vpre = strtoull(v, NULL, 16);
+    if ((v = field(line, "vc"))) sscanf(v, "%x/%x", &r->vconst[0], &r->vconst[1]);
+    if ((v = field(line, "fp"))) r->fpre = strtoull(v, NULL, 16);
+    if ((v = field(line, "fc"))) sscanf(v, "%x/%x", &r->fconst[0], &r->fconst[1]);
     return r->vs && r->fs;
 }
 
@@ -448,6 +470,214 @@ static void idx_dir(const char *dir, int depth) {
     closedir(dd);
 }
 
+// ------------------------------------------------------------------ content index (records with a prefix hash)
+// Shaders found by content wherever they are: every NVN code blob (its 0x30-byte header's magic 0x12345678, 4-byte
+// aligned) in the game files, Yaz0- and zstd-compressed ones decompressed (ACNH's Shader/*.szs, Dread's MSHD
+// containers in system/shd/*.bshdat - no container format needed), by the hash of its first SHADER_PREFIX bytes. A
+// record's full hash is checked against the code's length its constants give. Only files of the kinds that hold shaders
+// are read; which files had any, and where, is kept in cache/<game>/shader_index-<build ID>.txt (by file size and
+// time), so later starts read just those.
+typedef struct { uint64_t pre; uint32_t file, off; } CEnt;
+static CEnt *cidx;
+static size_t cidx_n, cidx_cap;
+typedef struct { char *rel; uint64_t size, mtime; uint8_t *mem; size_t len; } CFile;
+static CFile *cfiles;
+static int ncfiles;
+static char croot[1024];
+
+static bool shader_file_kind(const char *name) {  // the kinds of files games keep shaders in
+    static const char *const ext[] = {".szs", ".zs", ".sarc", ".bfsha", ".bshdat", ".ptcl", ".arc", ".pack", ".bfres",
+                                      ".bnsh", ".bin", NULL};
+    size_t l = strlen(name);
+    for (int i = 0; ext[i]; i++) {
+        size_t e = strlen(ext[i]);
+        if (l > e && !strcasecmp(name + l - e, ext[i])) return true;
+    }
+    return false;
+}
+
+static uint8_t *file_load(const char *path, size_t *n) {  // decompressed when Yaz0 / zstd
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *raw = len > 0 && len < 0x7FFFFFFF ? malloc((size_t)len) : NULL;
+    if (!raw || fread(raw, 1, (size_t)len, f) != (size_t)len) { free(raw); fclose(f); return NULL; }
+    fclose(f);
+    if (yaz0_size(raw, (size_t)len)) {
+        uint8_t *out = yaz0_decompress(raw, (size_t)len, n);
+        free(raw);
+        return out;
+    }
+    if (len >= 4 && !memcmp(raw, "\x28\xb5\x2f\xfd", 4)) {
+        unsigned long long sz = ZSTD_getFrameContentSize(raw, (size_t)len);
+        uint8_t *out = NULL;
+        if (sz != ZSTD_CONTENTSIZE_ERROR && sz != ZSTD_CONTENTSIZE_UNKNOWN && sz < (1ull << 31)) {
+            out = malloc(sz ? sz : 1);
+            size_t got = ZSTD_decompress(out, sz, raw, (size_t)len);
+            if (ZSTD_isError(got)) free(out), out = NULL;
+            else *n = got;
+        }
+        free(raw);
+        return out;
+    }
+    *n = (size_t)len;
+    return raw;
+}
+
+static void cidx_add(uint64_t pre, uint32_t file, uint32_t off) {
+    if (cidx_n == cidx_cap) cidx_cap = cidx_cap ? cidx_cap * 2 : 4096, cidx = realloc(cidx, cidx_cap * sizeof *cidx);
+    cidx[cidx_n++] = (CEnt){pre, file, off};
+}
+static int cent_cmp(const void *a, const void *b) {
+    uint64_t x = ((const CEnt *)a)->pre, y = ((const CEnt *)b)->pre;
+    return x < y ? -1 : x > y;
+}
+
+static int cfile_add(const char *rel, const struct stat *sb) {
+    cfiles = realloc(cfiles, sizeof *cfiles * (size_t)(ncfiles + 1));
+    cfiles[ncfiles] = (CFile){strdup(rel), (uint64_t)sb->st_size, (uint64_t)sb->st_mtime, NULL, 0};
+    return ncfiles++;
+}
+
+static void cidx_scan(const char *rel, const struct stat *sb) {
+    char path[2048];
+    snprintf(path, sizeof path, "%s/%s", croot, rel);
+    size_t n = 0;
+    uint8_t *d = file_load(path, &n);
+    if (!d) return;
+    int file = -1;
+    for (size_t o = 0; o + SHADER_PREFIX <= n; o += 4) {
+        if (rd32(d, o) != 0x12345678u) continue;
+        if (file < 0) file = cfile_add(rel, sb);
+        cidx_add(shader_code_hash(d + o, SHADER_PREFIX), (uint32_t)file, (uint32_t)o);
+    }
+    free(d);
+}
+
+static void cidx_walk(const char *rel, int depth) {
+    char dir[2048];
+    snprintf(dir, sizeof dir, "%s%s%s", croot, *rel ? "/" : "", rel);
+    DIR *dd = depth < 12 ? opendir(dir) : NULL;
+    if (!dd) return;
+    struct dirent *e;
+    while ((e = readdir(dd))) {
+        if (e->d_name[0] == '.') continue;
+        char r[2048], p[4096];
+        snprintf(r, sizeof r, "%s%s%s", rel, *rel ? "/" : "", e->d_name);
+        snprintf(p, sizeof p, "%s/%s", croot, r);
+        struct stat sb;
+        if (stat(p, &sb)) continue;
+        if (S_ISDIR(sb.st_mode)) cidx_walk(r, depth + 1);
+        else if (shader_file_kind(e->d_name)) cidx_scan(r, &sb);
+    }
+    closedir(dd);
+}
+
+static void cidx_cache_path(char *out, size_t n) {  // (one per version: a game's versions share cache/<game>/)
+    extern const char *game_cache_key(void);
+    snprintf(out, n, "cache/%s/shader_index-%02X%02X%02X%02X.txt", game_cache_key(), g_game.build_id[0], g_game.build_id[1],
+             g_game.build_id[2], g_game.build_id[3]);
+}
+
+// The cached index, when every file it lists is as it was (false: scan again)
+static bool cidx_load(void) {
+    char path[600];
+    cidx_cache_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[4200];
+    bool ok = fgets(line, sizeof line, f) && !strncmp(line, "nx shader index 1", 17);
+    while (ok && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] == 'F') {  // F <size> <mtime> <path>
+            unsigned long long size, mtime;
+            int at = 0;
+            if (sscanf(line, "F %llu %llu %n", &size, &mtime, &at) != 2 || !at) { ok = false; break; }
+            char p[4200];
+            snprintf(p, sizeof p, "%s/%s", croot, line + at);
+            struct stat sb;
+            if (stat(p, &sb) || (uint64_t)sb.st_size != size || (uint64_t)sb.st_mtime != mtime) { ok = false; break; }
+            cfile_add(line + at, &sb);
+        } else if (line[0] == 'E') {  // E <prefix> <file> <offset>
+            unsigned long long pre;
+            unsigned file, off;
+            if (sscanf(line, "E %llx %u %x", &pre, &file, &off) != 3 || (int)file >= ncfiles) { ok = false; break; }
+            cidx_add(pre, file, off);
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        for (int i = 0; i < ncfiles; i++) free(cfiles[i].rel);
+        free(cfiles), cfiles = NULL, ncfiles = 0;
+        cidx_n = 0;
+    }
+    return ok && cidx_n;
+}
+
+static void cidx_save(void) {
+    char path[600], tmp[620];
+    cidx_cache_path(path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "nx shader index 1\n");
+    for (int i = 0; i < ncfiles; i++)
+        fprintf(f, "F %llu %llu %s\n", (unsigned long long)cfiles[i].size, (unsigned long long)cfiles[i].mtime, cfiles[i].rel);
+    for (size_t i = 0; i < cidx_n; i++) fprintf(f, "E %016" PRIx64 " %u %x\n", cidx[i].pre, cidx[i].file, cidx[i].off);
+    bool ok = fclose(f) == 0;
+    if (ok) rename(tmp, path);
+    else remove(tmp);
+}
+
+static void cidx_build(const char *romfs) {
+    if (cidx_n) return;
+    snprintf(croot, sizeof croot, "%s", romfs);
+    double t0 = (double)clock() / CLOCKS_PER_SEC;
+    bool cached = cidx_load();
+    if (!cached) cidx_walk("", 0);
+    qsort(cidx, cidx_n, sizeof *cidx, cent_cmp);
+    if (!cached) cidx_save();
+    LOG("[shader] content index: %zu shader blobs in %d files (%s, %.1f s of CPU)\n", cidx_n, ncfiles,
+        cached ? "cached" : "scanned", (double)clock() / CLOCKS_PER_SEC - t0);
+}
+
+// A stage by content: the blob whose prefix and full hash match (its file decompressed once per run)
+static bool cidx_find(uint64_t hash, uint64_t pre, const uint32_t cons[2], ShaderBlob *b, uint8_t **owned) {
+    if (!pre || !cidx_n) return false;
+    size_t lo = 0, hi = cidx_n;
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (cidx[m].pre < pre) lo = m + 1; else hi = m; }
+    uint32_t len = cons[0] + cons[1];
+    for (size_t i = lo; i < cidx_n && cidx[i].pre == pre; i++) {
+        CFile *cf = &cfiles[cidx[i].file];
+        if (!cf->mem) {
+            char path[2048];
+            snprintf(path, sizeof path, "%s/%s", croot, cf->rel);
+            cf->mem = file_load(path, &cf->len);
+            if (!cf->mem) continue;
+        }
+        if ((size_t)cidx[i].off + len > cf->len || shader_code_hash(cf->mem + cidx[i].off, len) != hash) continue;
+        uint8_t *d = calloc(1, (size_t)len + 0x100);  // (zero padding past the constants)
+        memcpy(d, cf->mem + cidx[i].off, len);
+        *b = (ShaderBlob){d, len, NULL, cons[0], cons[1]};
+        *owned = d;
+        return true;
+    }
+    return false;
+}
+
+static bool cidx_has(uint64_t pre) {
+    if (!pre || !cidx_n) return false;
+    size_t lo = 0, hi = cidx_n;
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (cidx[m].pre < pre) lo = m + 1; else hi = m; }
+    return lo < cidx_n && cidx[lo].pre == pre;
+}
+
+static void cidx_release_files(void) {
+    for (int i = 0; i < ncfiles; i++) free(cfiles[i].mem), cfiles[i].mem = NULL, cfiles[i].len = 0;
+}
+
 // The shader's code (+ its constants), read from the game files; NULL: not there
 static uint8_t *blob_read(const IdxEnt *e, ShaderBlob *b, FILE **files) {
     uint8_t *d = calloc(1, (size_t)e->size + 0x100);  // (zero padding past the constants)
@@ -502,11 +732,18 @@ bool shader_cache_write(const char *path, const void *data, size_t n) {
 void shader_cache_tag_write(const char *tag_path, const char *tag) { shader_cache_write(tag_path, tag, strlen(tag)); }
 
 // ------------------------------------------------------------------ the run
-static const char shipped_list[] =
+// games/<id>/shader_variants.txt, by game: the running game's
+static const struct { const char *game, *list; } shipped_lists[] = {
 #include "shader_variants.inc"
-    ;
+    {NULL, NULL},
+};
 
-const char *shader_prep_shipped_list(void) { return shipped_list; }
+const char *shader_prep_shipped_list(void) {
+    extern const char *game_cache_key(void);
+    for (int i = 0; shipped_lists[i].game; i++)
+        if (!strcmp(shipped_lists[i].game, game_cache_key())) return shipped_lists[i].list;
+    return "";
+}
 
 // The game files' shaders as one id (order-independent): another game version has another
 static uint64_t idx_game_id(void) {
@@ -544,11 +781,16 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
             if (n > 0 && fread(list, 1, (size_t)n, f) != (size_t)n) list[0] = 0;
             fclose(f);
         }
-    } else list = strdup(shipped_list);
-    if (!list || !*list) { free(list); LOG("[shader] preparation: no variant list\n"); return false; }
-    if (!renderer_prepare_begin()) { free(list); LOG("[shader] preparation: no GPU device yet\n"); return false; }
+    } else list = strdup(shader_prep_shipped_list());
     uint64_t seen_game;
     char *seen = shader_seen_read(&seen_game);  // (the player's own list: after the shipped one)
+    if ((!list || !*list) && (!seen || !*seen)) {
+        free(list), free(seen);
+        LOG("[shader] preparation: no variant list for this game yet\n");
+        return false;
+    }
+    if (!list) list = strdup("");
+    if (!renderer_prepare_begin()) { free(list), free(seen); LOG("[shader] preparation: no GPU device yet\n"); return false; }
     int total = 0;
     for (char *p = list; *p; p++) total += *p == '\n';
     for (char *p = seen; p && *p; p++) total += *p == '\n';
@@ -559,9 +801,10 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
         snprintf(main_nso, sizeof main_nso, "%s/../exefs/main", romfs);
         idx_nso(main_nso);
     }
+    cidx_build(romfs);
     double t_idx = ms_now() - t0;
-    if (idx_n) {  // (the player's list of other game files - none yet, or an update: only what this game has)
-        uint64_t game = idx_game_id();
+    if (idx_n || cidx_n) {  // (the player's list of other game files - none yet, or an update: only what this game has)
+        uint64_t game = idx_game_id() ^ cidx_n * 0x9E3779B97F4A7C15ull;
         char *keep = NULL;
         if (seen && seen_game != game) {
             size_t n = 0;
@@ -574,7 +817,9 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
                 ShaderRec r;
                 if (l >= sizeof one) continue;
                 memcpy(one, line, l), one[l] = 0;
-                if (!shader_rec_parse(one, &r) || !idx_find(r.vs) || (r.kind == 'G' && !idx_find(r.fs))) continue;
+                if (!shader_rec_parse(one, &r) || !(idx_find(r.vs) || cidx_has(r.vpre)) ||
+                    (r.kind == 'G' && !(idx_find(r.fs) || cidx_has(r.fpre))))
+                    continue;
                 memcpy(keep + n, line, l), n += l, keep[n++] = '\n';
             }
             free(seen);
@@ -596,7 +841,13 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
         const IdxEnt *ev = idx_find(r.vs), *ef = r.kind == 'G' ? idx_find(r.fs) : NULL;
         ShaderBlob bv = {0}, bf = {0};
         uint8_t *dv = ev ? blob_read(ev, &bv, files) : NULL, *df = ef ? blob_read(ef, &bf, files) : NULL;
-        if (!dv || (r.kind == 'G' && !df)) missing++;
+        if (!dv) cidx_find(r.vs, r.vpre, r.vconst, &bv, &dv);  // (no container described it: by content)
+        if (!df && r.kind == 'G') cidx_find(r.fs, r.fpre, r.fconst, &bf, &df);
+        if (!dv || (r.kind == 'G' && !df)) {
+            if (missing++ < 40 && getenv("LARECOMP_SHADER_PREP_ONLY"))
+                LOG("[shader] not in the game files: %c %s%016llx %s%016llx\n", r.kind, dv ? "" : "vs ", (unsigned long long)r.vs,
+                    df || r.kind != 'G' ? "" : "fs ", (unsigned long long)r.fs);
+        }
         else if (renderer_prepare(&r, &bv, &bf)) *(own ? &prepared_seen : &prepared) += 1;
         else failed++;
         free(dv);
@@ -612,6 +863,7 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
     if (progress) progress(total + 1, total + 1);
     for (int i = 0; i < idx_nfiles; i++) if (files[i]) fclose(files[i]);
     free(files);
+    cidx_release_files();
     free(list);
     free(seen);
     LOG("[shader] prepared %d + %d seen before, not found %d%s%s (%d failed; index %zu shaders in %.0f ms, total %.0f ms)\n",
@@ -619,8 +871,19 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
     return true;
 }
 
+// At game start, before its first frame: the game's variants (shipped and seen before) are built, so a first visit has
+// no compile hitch (LARECOMP_SHADER_PREP=0: off). LARECOMP_SHADER_PREP_ONLY (`make corpus`): only that, with the
+// binary archive written (renderer.m), then exit.
 void shader_prep_boot(const char *romfs) {
     const char *e = getenv("LARECOMP_SHADER_PREP");
-    if (!e || !atoi(e)) return;
+    bool only = getenv("LARECOMP_SHADER_PREP_ONLY") != NULL;
+    if (e && !atoi(e) && !only) return;
     shader_prep_run(romfs, NULL, NULL);
+    if (only) {
+        extern void renderer_archive_flush(void);
+        renderer_archive_flush();
+        LOG("[shader] preparation only: done\n");
+        fflush(stderr);
+        _exit(0);
+    }
 }

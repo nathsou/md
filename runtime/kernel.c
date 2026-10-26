@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "game.h"
 #ifdef _WIN32
 #include "platform/windows_threads.h"
 #endif
@@ -129,8 +130,121 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // takes the presenting thread's: a frame's busy time is its period minus this.
 __thread uint64_t g_blocked_ns;
 
+// ------------------------------------------------------------------ per-core scheduling
+// Horizon runs one thread at a time on each core: the most urgent runnable one (lowest priority number; among equals,
+// the one already running keeps the core until it blocks or yields). Games rely on that order: a thread started on its
+// creator's core doesn't run before the creator blocks (ACNH's first worker locks a mutex its creator sets up right
+// after starting it), a more urgent thread woken on the waker's core runs before the waker goes on (Dread's movie
+// player frees what its dispatcher still waits on), and threads that share a core never record into the same state at
+// once (ACNH's layer jobs clear a render target at its first bind each frame: the first job of the core's order binds
+// it, and running them in parallel let a later layer's job clear the finished UI).
+// So a guest thread holds its core while it runs guest code: it takes it when it starts and after every kernel wait,
+// gives it up when it waits (kwait), sleeps or yields, and at its next safe point (an SVC, an HLE call) when a more
+// urgent thread of its core wants to run (it can't be stopped in between: guest code runs as native code). Threads
+// whose affinity spans several cores aren't scheduled (Horizon migrates them freely). A thread that can't get its core
+// within 1 s runs anyway (logged): a holder blocked in host code, outside the kernel, would otherwise hang the game.
+// LARECOMP_NO_SCHED=1: off (every thread runs at once, with the old approximations: start_defer, yield_to_woken).
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    KThread *owner;
+    uint64_t tickets;
+    KThread *waiters[128];
+    int nw;
+} CoreSched;
+static CoreSched g_cs[4] = {
+    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, {0}, 0},
+    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, {0}, 0},
+    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, {0}, 0},
+    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, {0}, 0},
+};
+static int g_sched = -1;
+static bool sched_on(void) {
+    if (g_sched < 0) g_sched = getenv("LARECOMP_NO_SCHED") == NULL;
+    return g_sched;
+}
+static bool sched_pinned(const KThread *t) {
+    return t->core >= 0 && t->core < 4 && t->affinity && !(t->affinity & (t->affinity - 1));
+}
+static KThread *sched_best(CoreSched *c) {  // (c->m held) the queue's most urgent, first come among equals
+    KThread *b = NULL;
+    for (int i = 0; i < c->nw; i++) {
+        KThread *w = c->waiters[i];
+        if (!b || w->prio < b->prio || (w->prio == b->prio && w->sched_ticket < b->sched_ticket)) b = w;
+    }
+    return b;
+}
+
+static void sched_acquire(KThread *t) {
+    if (!t || !sched_on() || t->sched_core >= 0 || !sched_pinned(t)) return;
+    CoreSched *c = &g_cs[t->core];
+    pthread_mutex_lock(&c->m);
+    t->sched_ticket = ++c->tickets;
+    if (c->nw < 128) c->waiters[c->nw++] = t;
+    t->sched_waiting = true;
+    if (c->owner && c->owner->prio > t->prio) c->owner->sched_preempt = true;  // more urgent: the holder yields
+    uint64_t t0 = plat_now_ns();
+    bool forced = false;
+    while (!(c->owner == NULL && sched_best(c) == t) && !g_rt_unwind) {
+        if (plat_now_ns() - t0 > 1000000000ull) { forced = true; break; }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 5000000;
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        pthread_cond_timedwait(&c->cv, &c->m, &ts);
+    }
+    for (int i = 0; i < c->nw; i++)
+        if (c->waiters[i] == t) { c->waiters[i] = c->waiters[--c->nw]; break; }
+    t->sched_waiting = false;
+    if (!c->owner) c->owner = t, t->sched_core = t->core;
+    static int logs = -1;  // LARECOMP_LOG_SCHED=<n>: the first n acquisitions and releases
+    if (logs < 0) logs = getenv("LARECOMP_LOG_SCHED") ? atoi(getenv("LARECOMP_LOG_SCHED")) : 0;
+    if (logs > 0) { logs--; LOG("[sched] %#x takes core %d%s (owner %#x)\n", t->handle, t->core, forced ? " (forced)" : "", c->owner ? c->owner->handle : 0); }
+    pthread_mutex_unlock(&c->m);
+    if (forced) {
+        static int nlog;
+        if (nlog++ < 20)
+            LOG("[sched] thread %#x (prio %d, core %d) waited 1 s for its core (held by %#x): runs anyway\n", t->handle,
+                t->prio, t->core, c->owner ? c->owner->handle : 0);
+    }
+}
+
+static void sched_release(KThread *t) {
+    if (!t || t->sched_core < 0) return;
+    CoreSched *c = &g_cs[t->sched_core];
+    pthread_mutex_lock(&c->m);
+    if (getenv("LARECOMP_LOG_SCHED") && t->handle == 0x116) LOG("[sched] %#x releases core %d (owner %#x)\n", t->handle, t->sched_core, c->owner ? c->owner->handle : 0);
+    if (c->owner == t) c->owner = NULL;
+    t->sched_core = -1;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->m);
+}
+
+// Host code about to block a guest thread outside the kernel (the render queue's fence waits: a GPU wait, a kernel
+// wait on the Switch): the core goes to the next thread of its queue meanwhile; it's taken back at the next safe point.
+void kernel_block_begin(void) {
+    KThread *t = t_cur;
+    if (t && t->sched_core >= 0) { sched_release(t); t->sched_resched = true; }
+}
+
+// A safe point (SVC entry / exit, HLE call): give the core to a more urgent thread that wants it; take it back after
+// a wait gave it up.
+void kernel_sched_point(void) {
+    KThread *t = t_cur;
+    if (!t || !sched_on()) return;
+    if (t->sched_preempt) {
+        t->sched_preempt = false;
+        sched_release(t);
+        sched_acquire(t);
+    } else if (t->sched_resched || (t->sched_core < 0 && sched_pinned(t))) {
+        t->sched_resched = false;
+        sched_acquire(t);
+    }
+}
+
 static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     pthread_cond_t *cv = t_cur ? &t_cur->cond : &g_nothread_cond;
+    if (t_cur && t_cur->sched_core >= 0) { sched_release(t_cur); t_cur->sched_resched = true; }  // (blocked: not runnable)
     uint64_t t0 = plat_now_ns();
     bool r = true;
     if (timeout_ns < 0) pthread_cond_wait(cv, &g_klock);
@@ -217,14 +331,35 @@ void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
 
+// Start order, approximated: on the Switch a thread started on its creator's core, with the same priority or less
+// urgent, doesn't run before the creator blocks (waits, sleeps, yields): nothing preempts the creator for it. Games rely
+// on it - ACNH's first worker locks a mutex its creator sets up right after starting it. Here every thread runs at
+// once, so a new thread holds back until its creator's next blocking call (block_seq), its exit, or 500 ms.
+// LARECOMP_NO_START_DEFER=1: off.
+static void start_defer(KThread *t) {
+    KThread *c = t->start_after;
+    uint64_t t0 = plat_now_ns();
+    while (!c->finished && c->block_seq == t->start_seq && !g_rt_unwind) {
+        if (plat_now_ns() - t0 > 500000000ull) {
+            LOG("[kernel] thread %#x: its creator %#x hasn't blocked in 500 ms: starting anyway\n", t->handle, c->handle);
+            break;
+        }
+        usleep(20);
+    }
+}
+
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+    t->sched_core = -1;
+    if (sched_on()) sched_acquire(t);
+    else if (t->start_after) start_defer(t);
     plat_thread_guest(t->prio);
     if (t->is_main) plat_thread_perf_core(PLAT_PERF_GAME);  // (the game's frame runs here)
     crash_handler_install();
     rt_set_fpcr(0);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
+    sched_release(t);
     pthread_mutex_lock(&g_klock);
     t->finished = true;
     if (getenv("LARECOMP_LOG_MOVIE")) LOG("[thread] handle %#x entry %llx arg %llx exited t=%llu\n", t->handle,
@@ -236,8 +371,13 @@ static void *thread_main(void *arg) {
     return NULL;
 }
 
+static int g_default_core;  // main.npdm's (the process's default core: what core -2 means)
+
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
+    t->sched_core = -1;
+    if (core == -2) core = g_default_core;
+    t->affinity = core >= 0 && core < 4 ? 1ull << core : 0xF;
     pthread_cond_init(&t->cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
@@ -273,10 +413,11 @@ static void thread_start(KThread *t) {
 #endif
 }
 
-KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio) {
+KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio, int core) {
     uint64_t stack = STACK_BASE + STACK_SIZE - ((stack_size + 0xFFFF) & ~0xFFFFull);
     region_add(stack, stack_size, 0xB, 3);
-    KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
+    g_default_core = core >= 0 && core < 4 ? core : 0;
+    KThread *t = thread_new(entry, 0, stack + stack_size, prio, g_default_core);
     t->is_main = true;
     t->handle = kernel_new_handle(&t->obj);
     return t;
@@ -299,6 +440,26 @@ void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t
         pthread_t w;
         if (!pthread_create(&w, NULL, hang_watch, (void *)(uintptr_t)s)) pthread_detach(w);
     }
+}
+
+// LARECOMP_DUMP_THREADS_AT=<seconds>[,...] (debugging): every thread's state at those times after boot
+static void *dump_at(void *arg) {
+    const char *e = arg;
+    uint64_t t0 = plat_now_ns();
+    for (char *p = (char *)e; p && *p;) {
+        double at = strtod(p, &p);
+        while (*p == ',') p++;
+        uint64_t when = t0 + (uint64_t)(at * 1e9), now = plat_now_ns();
+        if (when > now) usleep((useconds_t)((when - now) / 1000));
+        LOG("[threads] ===== at %.1f s =====\n", at);
+        kernel_dump_threads("[threads]");
+    }
+    return NULL;
+}
+__attribute__((constructor)) static void dump_at_start(void) {
+    const char *e = getenv("LARECOMP_DUMP_THREADS_AT");
+    pthread_t w;
+    if (e && *e && !pthread_create(&w, NULL, dump_at, (void *)e)) pthread_detach(w);
 }
 
 uint32_t kernel_current_thread_handle(void) { return t_cur ? t_cur->handle : 0; }
@@ -630,12 +791,17 @@ static int prof_svc = -1;
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
+    kernel_sched_point();
     svc_entry(c, imm, pc);
-    if (t_nurgent) yield_to_woken();
+    if (sched_on()) t_nurgent = 0, kernel_sched_point();
+    else if (t_nurgent) yield_to_woken();
     rt_unwind_point();
 }
 
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
+    // (the calls that can block or yield: SleepThread, WaitSynchronization, ArbitrateLock, WaitProcessWideKeyAtomic,
+    // WaitForAddress - see start_defer)
+    if (t_cur && (imm == 0x0B || imm == 0x18 || imm == 0x1A || imm == 0x1C || imm == 0x34)) t_cur->block_seq++;
     if (prof_svc < 0) prof_svc = ENV("LARECOMP_PROF_SVC") != NULL;
     if (prof_svc && imm < 0x80) {
         uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], lr = c->x[30];
@@ -711,7 +877,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x08: {  // CreateThread(_, entry, arg, stack_top, prio, core)
         KThread *t = thread_new(x[1], x[2], x[3], (int)x[4], (int)(int32_t)x[5]);
         t->handle = kernel_new_handle(&t->obj);
-        LOG("[kernel] CreateThread entry=%llx stack=%llx prio=%d -> %x\n", x[1], x[3], (int)x[4], t->handle);
+        LOG("[kernel] CreateThread entry=%llx arg=%llx stack=%llx prio=%d core=%d -> %x\n", x[1], x[2], x[3], (int)x[4], (int)(int32_t)x[5], t->handle);
         x[0] = R_OK;
         x[1] = t->handle;
         break;
@@ -719,14 +885,24 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x09: {  // StartThread
         KObject *o = handle_get((uint32_t)x[0]);
         if (!o || o->type != KOBJ_THREAD) { x[0] = R_INVALID_HANDLE; break; }
-        thread_start((KThread *)o);
+        KThread *nt = (KThread *)o;
+        static int defer = -1;
+        if (defer < 0) defer = getenv("LARECOMP_NO_START_DEFER") == NULL;
+        if (defer && !sched_on() && t_cur && nt->core == t_cur->core && nt->prio >= t_cur->prio)
+            nt->start_after = t_cur, nt->start_seq = t_cur->block_seq;
+        thread_start(nt);
         x[0] = R_OK;
         break;
     }
     case 0x0A: longjmp(t_cur->unwind, 1);  // ExitThread: back to thread_main, which signals the thread object
     case 0x0B: {  // SleepThread (in slices of at most 50 ms: a reboot doesn't wait out a long sleep)
         int64_t ns = (int64_t)x[0];
-        if (ns <= 0) { sched_yield(); break; }
+        if (ns <= 0) {  // a yield: the core goes to the next thread of its queue (equal priority included)
+            if (t_cur->sched_core >= 0) { sched_release(t_cur); t_cur->sched_resched = true; }
+            else sched_yield();
+            break;
+        }
+        if (t_cur->sched_core >= 0) { sched_release(t_cur); t_cur->sched_resched = true; }
         t_cur->sleeping = true;
         for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
             uint64_t d = end - now < 50000000 ? end - now : 50000000;
@@ -753,10 +929,28 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         KObject *o = handle_get((uint32_t)x[2]);
         x[0] = o ? R_OK : R_INVALID_HANDLE;
         x[1] = o ? (uint64_t)((KThread *)o)->core : 0;
-        x[2] = 0xF;
+        x[2] = o ? ((KThread *)o)->affinity : 0xF;
         break;
     }
-    case 0x0F: x[0] = R_OK; break;  // SetThreadCoreMask
+    case 0x0F: {  // SetThreadCoreMask(handle, ideal core, affinity): ideal -1 any core of the mask, -2 the process's
+                  // default, -3 keep it (only the mask changes)
+        KObject *o = handle_get((uint32_t)x[0]);
+        if (!o || o->type != KOBJ_THREAD) { x[0] = R_INVALID_HANDLE; break; }
+        KThread *t = (KThread *)o;
+        int ideal = (int)(int32_t)x[1];
+        uint64_t mask = x[2] & 0xF;
+        if (ideal == -2) ideal = g_default_core, mask = 1ull << ideal;
+        else if (ideal == -3) ideal = t->core;
+        if (!mask) mask = t->affinity;
+        if (ideal == -1 || !(mask >> ideal & 1)) ideal = mask ? __builtin_ctzll(mask) : t->core;
+        if (getenv("LARECOMP_LOG_THREADS"))
+            LOG("[kernel] thread %#x: core %d -> %d (mask %#llx)\n", t->handle, t->core, ideal, (unsigned long long)mask);
+        if (t == t_cur && t->sched_core >= 0 && t->sched_core != ideal) { sched_release(t); t->sched_resched = true; }
+        t->core = ideal;
+        t->affinity = mask;
+        x[0] = R_OK;
+        break;
+    }
     case 0x10: x[0] = t_cur->core; break;  // GetCurrentProcessorNumber
     case 0x11: case 0x12: case 0x17: {  // SignalEvent / ClearEvent / ResetSignal
         pthread_mutex_lock(&g_klock);
@@ -865,7 +1059,9 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
             // SDK sizes the heap as total - used, and asked for more than the pool without it), plus some slack
             uint64_t mods = 0;
             for (int i = 0; i < g_nmodules; i++) mods += g_modules[i].size;
-            v = heap_size + mods + 0x4000000;
+            static long long slack = -1;  // LARECOMP_USED_SLACK=<bytes> (experiments): instead of 64 MB
+            if (slack < 0) slack = getenv("LARECOMP_USED_SLACK") ? strtoll(getenv("LARECOMP_USED_SLACK"), NULL, 0) : 0x4000000;
+            v = heap_size + mods + (uint64_t)slack;
             break;
         }
         case 8: v = 0; break;
@@ -876,7 +1072,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 14: v = STACK_BASE; break;
         case 15: v = STACK_SIZE; break;
         case 16: case 17: v = 0; break;
-        case 18: v = 0x010093801237C000ull; break;  // program id: Metroid Dread
+        case 18: v = g_game.title_id; break;  // program id (main.npdm)
         case 20: v = 0; break;
         default: r = R_INVALID_ENUM; LOG("[kernel] GetInfo unknown id %u/%llu\n", id0, x[3]);
         }
@@ -1114,6 +1310,10 @@ KSharedMem *kernel_create_shared_memory(uint64_t size, void (*on_map)(KSharedMem
 void kernel_yield_to_urgent(uint64_t max_ns) {
     KThread *me = t_cur;
     if (!me) return;
+    if (sched_on()) {  // (the core goes to the more urgent threads that want it: they run first)
+        if (me->sched_core >= 0) { sched_release(me); sched_acquire(me); }
+        return;
+    }
     uint64_t t0 = plat_now_ns();
     for (;;) {
         bool busy = false;

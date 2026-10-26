@@ -55,8 +55,15 @@ static const char *md_find_str(Cpu *c, uint64_t md, const char *key) {
         return NULL;
     return s;
 }
+static MBuffer *md_find_buf(Cpu *c, uint64_t md, const char *key);
 static void md_set_int(Cpu *c, uint64_t md, const char *key, int32_t v) {
     gcall(c, guest_sym("_ZN5movie9MediaData8SetInt32EPKci"), md, (uintptr_t)key, (uint32_t)v, 0);
+}
+static MBuffer *md_find_buf(Cpu *c, uint64_t md, const char *key) {
+    uint64_t b = 0;
+    if (!md || !(gcall(c, guest_sym("_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE"), md, (uintptr_t)key, (uintptr_t)&b, 0) & 1))
+        return NULL;
+    return b >= GUEST_LO && b < GUEST_HI ? BUF(b) : NULL;
 }
 static void md_set_str(Cpu *c, uint64_t md, const char *key, const char *v) {
     gcall(c, guest_sym("_ZN5movie9MediaData9SetStringEPKcS2_"), md, (uintptr_t)key, (uintptr_t)v, 0);
@@ -94,6 +101,10 @@ typedef struct {
     OutReady ready[NOUT];
     int nready;
     int width, height, stride;
+    bool audio;              // an audio track (ACNH's opening movie: Vorbis): PCM16 interleaved out
+    bool client_bufs;        // the game hands its own output memory (GetOutputBuffer): frames are copied into it
+    uint64_t st_t0, st_in, st_out, st_rel, st_busy;  // (LARECOMP_LOG_MOVIE: throughput per second)
+    int channels, rate;
     struct SwsContext *sws;
     uint8_t *rgba;
     AVFrame *pending[NPENDING];
@@ -102,7 +113,9 @@ typedef struct {
     bool eos_pending;
     int64_t eos_time;
     bool stopped;  // Stop / Flush / destroyed: no indices handed out, no more events
+    int signalling;          // event signals in progress (outside the lock: dec_signal)
     pthread_mutex_t lock;
+    pthread_cond_t idle;     // signalling went back to 0
 } Decoder;
 
 static Decoder *self_state(Cpu *c) { return (Decoder *)(uintptr_t)((uint64_t *)(uintptr_t)c->x[0])[1]; }
@@ -115,11 +128,18 @@ static uint64_t dec_event(Decoder *d, int i) {
     return d->events[i];
 }
 
-// Signal one of the game's decoder events unless the decoder is stopped (under the lock: a Stop on another thread
-// can't slip between the check and the signal).
+// Signal one of the game's decoder events unless the decoder is stopped. The guest call runs outside the lock (it
+// may wait for its core at a scheduler safe point: holding a host lock there, another thread of that core blocked on
+// it would never let the core go), counted so that a Stop waits for it before clearing the events.
 static void dec_signal(Cpu *c, Decoder *d, int i) {
     pthread_mutex_lock(&d->lock);
-    if (!d->stopped) signal_guest_event(c, dec_event(d, i));
+    uint64_t ev = d->stopped ? 0 : dec_event(d, i);
+    if (ev) d->signalling++;
+    pthread_mutex_unlock(&d->lock);
+    if (!ev) return;
+    signal_guest_event(c, ev);
+    pthread_mutex_lock(&d->lock);
+    if (!--d->signalling) pthread_cond_broadcast(&d->idle);
     pthread_mutex_unlock(&d->lock);
 }
 
@@ -153,6 +173,61 @@ bool renderer_upload_nv12(NvnTexture *t, const void *nv12, uint32_t w, uint32_t 
 
 static void ok(Cpu *c) { c->x[0] = 0; }
 
+// An audio track: Vorbis (the extractor's codec headers: "csd-0" identification, "csd-1" setup, as MediaCodec has
+// them - or the WebM CodecPrivate, already Xiph-laced) or Opus ("csd-0" OpusHead), decoded to PCM16 interleaved.
+static void configure_audio(Cpu *c, Decoder *d, uint64_t md, const char *mime) {
+    bool opus = strstr(mime, "opus") != NULL;
+    const AVCodec *codec = avcodec_find_decoder(opus ? AV_CODEC_ID_OPUS : AV_CODEC_ID_VORBIS);
+    int32_t ch = 0, rate = 0;
+    md_find_int(c, md, "channel-count", &ch);
+    md_find_int(c, md, "sample-rate", &rate);
+    MBuffer *h0 = md_find_buf(c, md, "csd-0"), *h1 = md_find_buf(c, md, "csd-1");
+    if (!codec || !h0) {
+        LOG("[movie] Configure: %s track without codec headers (%dch %dHz)\n", mime, ch, rate);
+        c->x[0] = 1;
+        return;
+    }
+    d->ctx = avcodec_alloc_context3(codec);
+    if (ch > 0) av_channel_layout_default(&d->ctx->ch_layout, ch);
+    if (rate > 0) d->ctx->sample_rate = rate;
+    const uint8_t *p0 = (const uint8_t *)(uintptr_t)(h0->base + h0->offset);
+    uint32_t n0 = (uint32_t)h0->size;
+    uint8_t *x = NULL;
+    uint32_t nx = 0;
+    if (opus || p0[0] == 2) {  // OpusHead / CodecPrivate: as is
+        nx = n0;
+        x = av_mallocz(nx + AV_INPUT_BUFFER_PADDING_SIZE);
+        memcpy(x, p0, nx);
+    } else if (h1) {  // identification + a minimal comment header + setup, Xiph-laced
+        static const uint8_t comment[] = {3, 'v', 'o', 'r', 'b', 'i', 's', 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        const uint8_t *p1 = (const uint8_t *)(uintptr_t)(h1->base + h1->offset);
+        uint32_t n1 = (uint32_t)h1->size;
+        x = av_mallocz(1 + n0 / 255 + 1 + 1 + n0 + sizeof comment + n1 + AV_INPUT_BUFFER_PADDING_SIZE);
+        uint8_t *q = x;
+        *q++ = 2;
+        for (uint32_t k = n0; ; k -= 255) { *q++ = (uint8_t)(k >= 255 ? 255 : k); if (k < 255) break; }
+        *q++ = sizeof comment;
+        memcpy(q, p0, n0), q += n0;
+        memcpy(q, comment, sizeof comment), q += sizeof comment;
+        memcpy(q, p1, n1), q += n1;
+        nx = (uint32_t)(q - x);
+    }
+    d->ctx->extradata = x;
+    d->ctx->extradata_size = (int)nx;
+    if (avcodec_open2(d->ctx, codec, NULL) < 0) { LOG("[movie] cannot open decoder %s\n", codec->name); c->x[0] = 1; return; }
+    d->frame = av_frame_alloc();
+    d->pkt = av_packet_alloc();
+    d->audio = true;
+    d->channels = d->ctx->ch_layout.nb_channels ? d->ctx->ch_layout.nb_channels : (ch > 0 ? ch : 2);
+    d->rate = d->ctx->sample_rate ? d->ctx->sample_rate : (rate > 0 ? rate : 48000);
+    d->in_cap = 256 << 10;
+    d->out_cap = 64 << 10;
+    for (int i = 0; i < NIN; i++) if (!d->in_mem[i]) d->in_mem[i] = buf_get(d->in_cap);
+    for (int i = 0; i < NOUT; i++) if (!d->out_mem[i]) d->out_mem[i] = buf_get(d->out_cap);
+    LOG("[movie] decoder %s configured: %d channels, %d Hz\n", codec->name, d->channels, d->rate);
+    c->x[0] = 0;
+}
+
 static void dec_configure(Cpu *c) {
     Decoder *d = self_state(c);
     uint64_t md = c->x[1];
@@ -160,6 +235,7 @@ static void dec_configure(Cpu *c) {
     int32_t w = 0, h = 0;
     md_find_int(c, md, "width", &w);
     md_find_int(c, md, "height", &h);
+    if (mime && (strstr(mime, "vorbis") || strstr(mime, "opus"))) { configure_audio(c, d, md, mime); return; }
     enum AVCodecID id = !mime ? AV_CODEC_ID_VP9 : strstr(mime, "vp9") ? AV_CODEC_ID_VP9 : strstr(mime, "vp8") ? AV_CODEC_ID_VP8
                       : strstr(mime, "avc") ? AV_CODEC_ID_H264 : AV_CODEC_ID_NONE;
     const AVCodec *codec = id != AV_CODEC_ID_NONE ? avcodec_find_decoder(id) : NULL;
@@ -194,11 +270,17 @@ static void dec_register_events(Cpu *c) {
 static void dec_output_format(Cpu *c, Decoder *d, uint64_t md) {
     if (!md) return;
     gcall(c, guest_sym("_ZN5movie9MediaData5ClearEv"), md, 0, 0, 0);
+    if (d->audio) {
+        md_set_str(c, md, "mime", "audio/raw");
+        md_set_int(c, md, "channel-count", d->channels);
+        md_set_int(c, md, "sample-rate", d->rate);
+        return;
+    }
     md_set_str(c, md, "mime", "video/raw");
     md_set_int(c, md, "width", d->width);
     md_set_int(c, md, "height", d->height);
-    md_set_int(c, md, "stride", d->stride);
-    md_set_int(c, md, "slice-height", (d->height + 15) & ~15);
+    md_set_int(c, md, "stride", d->client_bufs ? d->width : d->stride);
+    md_set_int(c, md, "slice-height", d->client_bufs ? d->height : (d->height + 15) & ~15);
     md_set_int(c, md, "crop-left", 0);
     md_set_int(c, md, "crop-top", 0);
     md_set_int(c, md, "crop-right", d->width - 1);
@@ -232,14 +314,22 @@ static void dec_halt(Cpu *c, Decoder *d, const char *why) {
     static uint64_t clear_event;
     if (!clear_event) clear_event = guest_sym("_ZN2nn2os10ClearEventEPNS0_9EventTypeE");
     pthread_mutex_lock(&d->lock);
-    if (!d->stopped) {
+    uint64_t evs[4] = {0};
+    bool stopping = !d->stopped;
+    if (stopping) {
         d->stopped = true;
+        while (d->signalling) pthread_cond_wait(&d->idle, &d->lock);  // (a signal in progress lands before the clears)
+        for (int i = 0; i < 4; i++) evs[i] = dec_event(d, i);
+    }
+    pthread_mutex_unlock(&d->lock);
+    if (stopping) {  // (outside the lock, as dec_signal)
         uint64_t saved[4];
         memcpy(saved, c->x, sizeof saved);
         for (int i = 0; i < 4; i++)
-            if (dec_event(d, i)) gcall(c, clear_event, dec_event(d, i), 0, 0, 0);
+            if (evs[i]) gcall(c, clear_event, evs[i], 0, 0, 0);
         memcpy(c->x, saved, sizeof saved);
     }
+    pthread_mutex_lock(&d->lock);
     // Flush drops what is in flight: queued frames, ready outputs, inputs not yet decoded
     for (int i = 0; i < d->npending; i++) av_frame_free(&d->pending[i]);
     d->npending = d->nready = 0;
@@ -253,12 +343,26 @@ static void dec_halt(Cpu *c, Decoder *d, const char *why) {
 static void dec_stop(Cpu *c) { dec_halt(c, self_state(c), "stopped"); c->x[0] = 0; }
 static void dec_flush(Cpu *c) { dec_halt(c, self_state(c), "flushed"); c->x[0] = 0; }
 
+static void dec_stats(Decoder *d) {
+    if (!ENV("LARECOMP_LOG_MOVIE")) return;
+    uint64_t now = plat_now_ns();
+    if (!d->st_t0) d->st_t0 = now;
+    if (now - d->st_t0 < 1000000000ull) return;
+    int outs = 0;
+    for (int i = 0; i < NOUT; i++) outs += d->out_busy[i];
+    LOG("[movie] %s: %llu inputs, %llu outputs, %llu released, %llu refused (backpressure) /s; %d outputs held, %d ready, %d pending\n",
+        d->audio ? "audio" : "video", (unsigned long long)d->st_in, (unsigned long long)d->st_out, (unsigned long long)d->st_rel,
+        (unsigned long long)d->st_busy, outs, d->nready, d->npending);
+    d->st_t0 = now, d->st_in = d->st_out = d->st_rel = d->st_busy = 0;
+}
+
 static void dec_acquire_input(Cpu *c) {
     Decoder *d = self_state(c);
     pthread_mutex_lock(&d->lock);
+    dec_stats(d);
     int out_free = 0;
     for (int i = 0; i < NOUT; i++) if (!d->out_busy[i]) out_free++;
-    if (d->stopped || out_free < 2 || d->npending) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }  // backpressure
+    if (d->stopped || out_free < 2 || d->npending) { d->st_busy++; pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }  // backpressure
     int idx = -1, free_n = 0;
     for (int i = 0; i < NIN; i++)
         if (!d->in_busy[i]) { if (idx < 0) idx = i; else free_n++; }
@@ -289,7 +393,27 @@ static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
     if (slot < 0) return false;
     uint8_t *o = d->out_mem[slot];
     uint32_t size = 0;
-    if (!(flags & MOVIE_EOS)) {
+    if (d->audio && !(flags & MOVIE_EOS)) {  // PCM16 interleaved, from planar or packed float / s16
+        int ch = d->channels, n = f->nb_samples;
+        if ((uint32_t)(n * ch * 2) > d->out_cap) n = (int)(d->out_cap / (uint32_t)(ch * 2));
+        int16_t *pcm = (int16_t *)o;
+        bool planar = av_sample_fmt_is_planar(f->format);
+        for (int k = 0; k < n; k++)
+            for (int j = 0; j < ch; j++) {
+                float v;
+                const uint8_t *src = planar ? f->extended_data[j] : f->extended_data[0];
+                int at = planar ? k : k * ch + j;
+                switch (av_get_packed_sample_fmt(f->format)) {
+                case AV_SAMPLE_FMT_FLT: v = ((const float *)src)[at]; break;
+                case AV_SAMPLE_FMT_S16: v = ((const int16_t *)src)[at] / 32768.0f; break;
+                case AV_SAMPLE_FMT_S32: v = ((const int32_t *)src)[at] / 2147483648.0f; break;
+                default: v = 0; break;
+                }
+                v = v < -1 ? -1 : v > 1 ? 1 : v;
+                pcm[k * ch + j] = (int16_t)(v * 32767.0f);
+            }
+        size = (uint32_t)(n * ch * 2);
+    } else if (!(flags & MOVIE_EOS)) {
         int h = d->height, w = d->width, uv_off = d->stride * ((h + 15) & ~15);
         for (int y = 0; y < h; y++) memcpy(o + y * d->stride, f->data[0] + y * f->linesize[0], w);
         for (int y = 0; y < h / 2; y++) {  // interleave U and V
@@ -328,6 +452,7 @@ static void dec_send_input(Cpu *c) {
     uint32_t flags = (uint32_t)c->x[5];
     pthread_mutex_lock(&d->lock);
     if (d->ctx && size > 0 && idx >= 0 && idx < NIN) {
+        d->st_in++;
         av_packet_unref(d->pkt);
         d->pkt->data = d->in_mem[idx] + off;
         d->pkt->size = size;
@@ -362,6 +487,7 @@ static void dec_acquire_output(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     if (d->stopped || !d->nready) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }
     OutReady r = d->ready[0];
+    d->st_out++;
     memmove(d->ready, d->ready + 1, --d->nready * sizeof *d->ready);
     int remaining = d->nready;
     pthread_mutex_unlock(&d->lock);
@@ -377,6 +503,11 @@ static void dec_get_output_buffer(Cpu *c) {
     int i = (int)c->x[1];
     MBuffer *b = BUF(c->x[2]);
     if (i < 0 || i >= NOUT || !b) { c->x[0] = 1; return; }
+    if (ENV("LARECOMP_LOG_MOVIE")) {
+        static int n;
+        if (n++ < 6) LOG("[movie] GetOutputBuffer %d: buffer base %#llx capacity %llu offset %d size %d (%s)\n", i,
+                         (unsigned long long)b->base, (unsigned long long)b->capacity, b->offset, b->size, d->audio ? "audio" : "video");
+    }
     if (b->base && b->capacity == 8) {
         // native-texture mode: the buffer's data is the game's NVNtexture (its host object at +0)
         NvnTexture *t = *(NvnTexture **)(uintptr_t)b->base;
@@ -401,6 +532,31 @@ static void dec_get_output_buffer(Cpu *c) {
         c->x[0] = 0;
         return;
     }
+    if (b->base && b->capacity) {
+        // the caller's own memory (ACNH's opening movie): the frame copied into it - PCM as is, video as NV12
+        // packed tight (stride = width, the chroma right after the luma: the layout GetOutputFormat reports for it)
+        uint8_t *dst = (uint8_t *)(uintptr_t)b->base;
+        uint32_t n = 0;
+        if (d->audio || !d->out_size[i]) {
+            n = d->out_size[i] < b->capacity ? d->out_size[i] : (uint32_t)b->capacity;
+            memcpy(dst, d->out_mem[i], n);
+        } else {
+            int w = d->width, h = d->height;
+            uint64_t need = (uint64_t)w * h * 3 / 2;
+            if (need <= b->capacity) {
+                uint32_t uv_off = (uint32_t)(d->stride * ((h + 15) & ~15));
+                for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, d->out_mem[i] + (size_t)y * d->stride, (size_t)w);
+                for (int y = 0; y < h / 2; y++)
+                    memcpy(dst + (size_t)w * h + (size_t)y * w, d->out_mem[i] + uv_off + (size_t)y * d->stride, (size_t)w);
+                n = (uint32_t)need;
+            }
+        }
+        b->offset = 0;
+        b->size = (int32_t)n;
+        d->client_bufs = true;
+        c->x[0] = 0;
+        return;
+    }
     b->offset = 0;
     b->owned = 0;
     b->base = (uint64_t)(uintptr_t)d->out_mem[i];
@@ -413,7 +569,7 @@ static void dec_release_output(Cpu *c) {
     Decoder *d = self_state(c);
     int i = (int)c->x[1];
     pthread_mutex_lock(&d->lock);
-    if (i >= 0 && i < NOUT) d->out_busy[i] = false;
+    if (i >= 0 && i < NOUT) d->out_busy[i] = false, d->st_rel++;
     bool produced = flush_pending(d);
     pthread_mutex_unlock(&d->lock);
     dec_signal(c, d, 0);  // input may be accepted again
@@ -503,6 +659,7 @@ static void dec_construct(Cpu *c) {
     uint64_t *self = (uint64_t *)(uintptr_t)c->x[0];
     Decoder *d = calloc(1, sizeof *d);
     pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->idle, NULL);
     d->stopped = true;  // (until Start)
     movie_track(d, true);
     self[0] = g_dec_vt;

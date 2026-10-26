@@ -9,7 +9,9 @@
 #include "hle.h"
 
 typedef struct { const uint64_t *addrs; const GuestFn *fns; uint64_t count, lo, hi; } FnTable;
-static FnTable tables[3];  // main, sdk, subsdk0
+#define MAX_TABLES 16
+static FnTable tables[MAX_TABLES];  // the game code library's modules, in load order
+static int ntables;
 
 // HLE stubs live at fake addresses HLE_BASE + 16*i
 #define MAX_HLE 4096
@@ -114,16 +116,16 @@ void *hle_alloc(uint64_t size) {
 
 void dispatch_init(void) {  // (after gamelib_load)
     const GameLibTables *g = gamelib_tables();
-    uint64_t nm = *g->main_count, ns = *g->sdk_count;
-    tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, g->main_addrs[0], g->main_addrs[nm - 1]};
-    tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, g->sdk_addrs[0], g->sdk_addrs[ns - 1]};
-    uint64_t n0 = g->subsdk0_count ? *g->subsdk0_count : 0;
-    tables[2] = n0 ? (FnTable){g->subsdk0_addrs, g->subsdk0_fns, n0, g->subsdk0_addrs[0], g->subsdk0_addrs[n0 - 1]}
-                   : (FnTable){0};
+    ntables = 0;
+    for (uint32_t i = 0; i < g->nmodules && ntables < MAX_TABLES; i++) {
+        const GameLibModule *m = &g->modules[i];
+        uint64_t n = *m->count;
+        if (n) tables[ntables++] = (FnTable){m->addrs, m->fns, n, m->addrs[0], m->addrs[n - 1]};
+    }
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < ntables; t++) {
         FnTable *ft = &tables[t];
         if (!ft->count || addr < ft->lo || addr > ft->hi) continue;
         uint64_t lo = 0, hi = ft->count;
@@ -141,12 +143,46 @@ GuestFn dispatch_lookup(uint64_t addr) {
 #define DCACHE 4096
 static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
 
+// LARECOMP_LOG_HLE=<text>[,<text>...] (debugging): every call of a host-implemented function whose name contains one of
+// them is logged with its arguments and its result (x0), at most LARECOMP_LOG_HLE_MAX (default 5000) lines.
+static __thread int t_logged_slot;
+static _Atomic int hle_log_lines;
+static void hle_logged(Cpu *c) {
+    int i = t_logged_slot;
+    uint64_t a[5] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]}, lr = c->x[30];
+    hle_slots[i].fn(c);
+    LOG("[hle] %s(%llx, %llx, %llx, %llx, %llx) -> %llx (lr %llx)\n", hle_slots[i].name, (unsigned long long)a[0],
+        (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3], (unsigned long long)a[4],
+        (unsigned long long)c->x[0], (unsigned long long)lr);
+}
+static bool hle_log_wanted(const char *name) {
+    static const char *f;
+    static int init, max;
+    if (!init) {
+        init = 1;
+        f = getenv("LARECOMP_LOG_HLE");
+        max = getenv("LARECOMP_LOG_HLE_MAX") ? atoi(getenv("LARECOMP_LOG_HLE_MAX")) : 5000;
+    }
+    if (!f || !*f || hle_log_lines >= max) return false;
+    for (const char *p = f; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        for (const char *q = name; *q; q++)
+            if (!strncmp(q, p, n)) { hle_log_lines++; return true; }
+        p += n + (e != NULL);
+    }
+    return false;
+}
+
 __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
+        extern void kernel_sched_point(void);
+        kernel_sched_point();  // (and a scheduling one: kernel.c)
         int i = (int)((pc - HLE_BASE) / 16);
         if (i < hle_count) {
+            if (hle_slots[i].fn && hle_log_wanted(hle_slots[i].name)) { t_logged_slot = i; return hle_logged; }
             if (hle_slots[i].fn) return hle_slots[i].fn;
             unimpl_pc = pc;
             return hle_unimplemented;
@@ -202,10 +238,11 @@ const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
     static uint64_t n;
     static __thread char name[32];
     if (!byhost) {
-        uint64_t total = tables[0].count + tables[1].count + tables[2].count, k = 0;
+        uint64_t total = 0, k = 0;
+        for (int t = 0; t < ntables; t++) total += tables[t].count;
         uint64_t (*v)[2] = malloc(total * sizeof *v);
         if (!v) return NULL;
-        for (int t = 0; t < 3; t++)
+        for (int t = 0; t < ntables; t++)
             for (uint64_t i = 0; i < tables[t].count; i++) {
                 v[k][0] = (uint64_t)(uintptr_t)tables[t].fns[i];
                 v[k++][1] = tables[t].addrs[i];

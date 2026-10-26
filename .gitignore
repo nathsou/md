@@ -13,4 +13,6 @@ __pycache__/
 save/
 cache/
 dreadrecomp.ini
+nx.ini
 .DS_Store
+data/

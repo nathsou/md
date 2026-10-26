@@ -1,20 +1,28 @@
-# Dread Recomp
+# nx
 
-A static recompilation of **Metroid Dread** (Nintendo Switch, 2021, version 1.0.0) into a native **macOS** application
-(Apple Silicon, Metal). The game's own ARM64 code is translated to C ahead of time and compiled for your Mac; the
-Switch's operating system, GPU API (NVN), audio, video decoding and input are replaced by host implementations. It is
-not an emulator: the game runs as a native program.
+A static recompilation engine for **Nintendo Switch** games, producing native **macOS** applications (Apple Silicon,
+Metal). A game's own ARM64 code is translated to C ahead of time and compiled for your Mac; the Switch's operating
+system, GPU API (NVN), audio, video decoding and input are replaced by host implementations. It is not an emulator:
+the game runs as a native program.
+
+| Game | Versions | State |
+|---|---|---|
+| **Metroid Dread** | 1.0.0, 2.1.0 | Playable from the opening to the last area (54 save checkpoints checked) |
+| **Animal Crossing: New Horizons** | 1.0.0, 2.0.7 | Playable: the intro, character creation, the opening movie, arriving on the island and playing there |
+
+Any other game boots through the same engine without a profile (its title ID and code come from its own files); a
+profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#adding-a-game)).
 
 > [!IMPORTANT]
 > **No Nintendo files are included in this repository** - no game code, no assets, no keys, no generated C. You need
-> your own legally obtained copy of Metroid Dread **1.0.0** (the cartridge / base version). The game code is
-> recompiled on your machine from your own files. Instructions for dumping games or keys will not be provided.
+> your own legally obtained copies of the games. The game code is recompiled on your machine from your own files.
+> Instructions for dumping games or keys will not be provided.
 
 > [!NOTE]
 > This project was built almost entirely with AI (Anthropic's Claude, through Claude Code), directed and reviewed by a
 > human. It is an early, experimental work in progress: expect bugs.
 
-![The title screen](docs/screenshots/title.jpg)
+![Metroid Dread's title screen](docs/screenshots/title.jpg)
 
 | | |
 |---|---|
@@ -22,71 +30,73 @@ not an emulator: the game runs as a native program.
 | ![Ghavoran](docs/screenshots/ghavoran.jpg) | ![Ferenia](docs/screenshots/ferenia.jpg) |
 | ![Itorash, near the end of the game](docs/screenshots/itorash.jpg) | |
 
-<sub>Screenshots of the game running in Dread Recomp on an M4 Pro Mac (from the opening to the last area, captured by
+<sub>Metroid Dread running in nx on an M4 Pro Mac (from the opening to the last area, captured by
 `tools/checkpoints.sh`). Metroid Dread © Nintendo.</sub>
 
 ## Status
 
-- Boots, plays its movies, runs the title screen, save files and the whole opening, and is playable with a gamepad or
-  the keyboard.
-- Runs at your display's refresh rate: 120 fps on a 120 Hz (ProMotion) Mac, at the right game speed (the game steps
-  its world by elapsed time; measured, see PLAN.md "Frame rate"). Cutscenes play at their own 30 fps.
-- Every one of the 832 unique shader stages the game ships translates to Metal and compiles (`make corpus`).
-- Checked against a ladder of 54 save files spanning the whole game (every area, from the opening to Raven Beak): each
-  one loads and runs three minutes of scripted running, jumping and shooting without crashing, and renders correctly
-  (`tools/checkpoints.sh`, see [Testing](#testing)). This is not a full playthrough: nobody has finished the game on
-  it yet.
-- Not done: an in-game menu, audio polish (the I3DL2 reverb effect the game uses is not implemented yet), Linux and
-  Windows (the Vulkan backend from LASRecomp is there but has not been built), version 2.1.0.
+- **Metroid Dread** boots, plays its movies, runs the title screen, save files and the whole game's areas, and is
+  playable with a gamepad or the keyboard at your display's refresh rate (120 fps on a ProMotion Mac). Every one of
+  the 832 unique shader stages it ships translates to Metal and compiles. Checked against a ladder of 54 save files
+  spanning the whole game: each loads and runs minutes of scripted play without crashing and renders correctly
+  (`tools/checkpoints.sh`). Nobody has finished the game on it yet.
+- **Animal Crossing: New Horizons** boots to the title screen, runs the whole intro (Tom Nook's questions, name and
+  birthday, the character creator, the island choice), plays the opening movie with its audio and lands on the island,
+  where you can walk around and play, at 120 fps.
+- **Game updates** are applied when extracting (`--update`): the update's code and its romfs patch over the base
+  game's.
+- Not done: an in-game menu, the I3DL2 reverb audio effect, online features, Linux and Windows (the Vulkan backend
+  from LASRecomp is there but has not been built).
 
 See [PLAN.md](PLAN.md) for the design, the full status and the known problems.
 
 ## Building
 
 Requirements: an Apple Silicon Mac, Xcode command line tools, [Homebrew](https://brew.sh) `llvm` (clang), `sdl3`,
-`ffmpeg`, Python 3 and [Bun](https://bun.sh) (only for extracting the game).
+`ffmpeg`, `zstd`, Python 3 and [Bun](https://bun.sh) (only for extracting games).
 
 ```sh
-brew install llvm sdl3 ffmpeg
+brew install llvm sdl3 ffmpeg zstd
+python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
 ```
 
-1. **Your game files.** Put your own dump of Metroid Dread 1.0.0 (`.xci`) in the repository folder, with your own
-   `prod.keys` (and `title.keys` if you have one) next to it, then extract it:
+1. **Extract your game files** into `data/<name>/` (any name; it is what you pass as `GAME` below). Put your own
+   `prod.keys` (and `title.keys` if you have one) in the repository folder or next to the dump:
 
    ```sh
-   bun extract-xci.mts "Metroid Dread.xci"
+   bun extract.mts "Metroid Dread.xci" data/dread
+   bun extract.mts "Metroid Dread.xci" data/dread-2.1.0 --update "Metroid Dread Update 2.1.0.nsp"
+   bun extract.mts "Animal Crossing New Horizons.nsp" data/acnh
+   bun extract.mts "Animal Crossing New Horizons.nsp" data/acnh-2.0.7 --update "Animal Crossing New Horizons v2.0.7.nsp"
    ```
 
-   This writes `exefs/` (the game code: `main`, `sdk`, `subsdk0`, ...) and `romfs/` (the game data) next to it. If you
-   already have extracted `exefs/` and `romfs/` folders, put those there instead. All of these stay out of git
-   (`.gitignore`).
+   Each writes `exefs/` (the game code: `main`, `sdk`, `subsdk0`, ...) and `romfs/` (the game data). XCI (cartridge)
+   and NSP (eShop) dumps both work; `--update` applies an update NSP on top. `data/` can be a symlink to another disk.
+   All of these stay out of git (`.gitignore`).
 
-2. **The recompiler's Python environment** (once):
+2. **Recompile the game code** into C (`generated/<name>/`, under a minute), then **build** the app and the game's
+   library (`build/nx`, shared by every game, and `build/<name>/game.dylib`; a few minutes the first time):
 
    ```sh
-   python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
+   make gen GAME=acnh
+   make -j10 GAME=acnh
    ```
 
-3. **Recompile the game code** from your `exefs/` into C (`generated/`, about 25 seconds), then **build** the runtime
-   and the game library (a few minutes the first time):
-
-   ```sh
-   make gen
-   make -j10
-   ```
+3. **Optional, recommended: prebuild the shaders** (`make corpus GAME=acnh`, see [Shaders](#shaders)).
 
 4. **Play:**
 
    ```sh
-   ./build/dreadrecomp .
+   ./build/nx data/acnh
    ```
 
-   Saves go to `save/`, settings to `dreadrecomp.ini`, shader caches to `cache/` - all in the repository folder.
+   The app picks the game library built for those game files. Saves go to `save/<game>/`, settings to `nx.ini`,
+   shader caches to `cache/<game>/`, all in the repository folder.
 
 ## Controls
 
-Any controller SDL recognises (Nintendo layout by position: right face button = A, bottom = B, top = X, left = Y; in
-the game B jumps and Y shoots), or the keyboard:
+Any controller SDL recognises (Nintendo layout by position: right face button = A, bottom = B, top = X, left = Y), or
+the keyboard:
 
 | Switch | Keyboard |
 |---|---|
@@ -99,29 +109,61 @@ the game B jumps and Y shoots), or the keyboard:
 | Stick clicks | F / keypad 0 |
 | Right stick | Keypad 8 / 5 / 4 / 6 |
 
-Rebind in `dreadrecomp.ini` (`bind_key_*` / `bind_pad_*` lines). F11 toggles fullscreen. A controller SDL doesn't know
-can be added with a mapping line in `gamecontrollerdb.txt` ([SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)).
+Rebind in `nx.ini` (`bind_key_*` / `bind_pad_*` lines). F11 toggles fullscreen. A controller SDL doesn't know can be
+added with a mapping line in `gamecontrollerdb.txt` ([SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)).
+
+## Shaders
+
+Switch games ship compiled Maxwell GPU shaders; nx translates them to Metal when a draw first needs them, which can
+hitch on a first visit. To avoid that:
+
+- `games/<id>/shader_variants.txt` lists the pipeline variants (shader pairs and the render state Metal needs at
+  compile time) recorded while playing (`LARECOMP_RECORD_KEYS=games/<id>/shader_variants.txt`, for instance during
+  the checkpoint runs). The lists hold hashes and render state only, no game code.
+- At startup nx finds each listed shader in your game files (an index of their shader containers, built once per
+  game version: about a minute for Animal Crossing's 100,000 files, then cached in
+  `cache/<game>/shader_index-<build ID>.txt`) and builds the pipelines before the first frame (under a second once
+  cached). Anything not listed, or not found in the files, still compiles on first use.
+- `make corpus GAME=<name>` translates and compiles every shader the game ships (a check of the translator: about
+  40 minutes for Animal Crossing's 9,558, `SKIP_CHECK=1` skips it), then builds the listed variants into a Metal
+  binary archive (`cache/<game>/shaders-<build ID>.metalarchive`) that later launches load instead of compiling.
 
 ## Testing
 
-- `make corpus` - translates every shader in `romfs/system/shd` and compiles it with Metal.
-- `tools/checkpoints.sh <dir> [jobs]` - boots each folder of a save-file ladder (folders holding
+- `make corpus GAME=<name>`: translates every shader in the game's files and compiles it with Metal (Metroid Dread:
+  all 832; Animal Crossing: all but 7 of 9,558, agl debug shaders using a multisample fetch and a per-texel-offset
+  gather the translator doesn't do yet).
+- `tools/checkpoints.sh <dir> [jobs]` (Metroid Dread): boots each folder of a save-file ladder (folders holding
   `profile0/*.bmssv`; for example the 54 checkpoints of
   [ZacharyACoon/MetroidDreadSaveFiles](https://github.com/ZacharyACoon/MetroidDreadSaveFiles)) from a scratch copy of
   its save, continues it, explores for a few minutes (`EXPLORE=<seconds>`) and captures frames to `build/cp/<NNN>/`;
-  `tools/checkpoint_sheet.sh <dir>` puts them next to each checkpoint's own screenshot.
-- `LARECOMP_RECORD=<file>` records your inputs while you play; `LARECOMP_REPLAY=<file>` plays them back.
-- More test hooks (scripted input, screenshots, per-pass frame dumps, a virtual gamepad) are listed in PLAN.md.
+  `GAME_DIR=data/dread-2.1.0` runs another version.
+- `LARECOMP_INPUT="frame:BUTTON:frames,..."` scripts the controller, `LARECOMP_SHOT_AT=frame,...` saves screenshots;
+  `LARECOMP_RECORD=<file>` records your inputs while you play and `LARECOMP_REPLAY=<file>` plays them back.
+  `LARECOMP_TIME_OFFSET=<seconds>` shifts the clock the game sees (Animal Crossing's time of day).
+- More test hooks (per-pass frame dumps, a virtual gamepad, shader debugging) are listed in PLAN.md.
 
 ## How it works
 
-- `tools/gen.py` (with `lifter.py` and `simd_c.py`) translates each module of the game (`main`, `sdk`, `subsdk0`) to
+- `tools/gen.py` (with `lifter.py` and `simd_c.py`) translates each module of a game (`main`, `sdk`, `subsdk*`) to
   C: one C function per guest function, guest registers in a `Cpu` struct, guest addresses equal to host addresses,
   indirect branches through a dispatch table, FP/SIMD as inline ARM64 assembly.
 - `runtime/` replaces the Switch: a small Horizon kernel (threads, synchronisation, memory), IPC services (file
   system over `romfs/`, saves, HID, audio renderer, time, settings, applets), NVN on Metal with a Maxwell shader
-  translator, and video playback on FFmpeg.
-- See [PLAN.md](PLAN.md) for the details and the bugs found along the way.
+  translator, and video playback (VP9, Vorbis, Opus) on FFmpeg.
+- `games/<id>/` holds what is specific to one game: its versions (by the main program's build ID), the addresses its
+  patches and hooks use for each version, and engine behaviours it opts into.
+
+## Adding a game
+
+1. Extract it (`bun extract.mts <dump> data/<name>`), `make gen GAME=<name>` and `make GAME=<name>`, and run it. With
+   no profile it runs on the engine alone, keyed by its title ID.
+2. When it needs game-specific work, add `games/<id>/`: `profile.h` (its name and versions, by the build ID `make gen`
+   prints), `game.c` (the profile: hooks, boot fixes, flags), `patches.py` (per-instruction patches and hook sites for
+   the generator) and one `patches_<version>.h` / `runtime_<version>.h` address table per version. `games/acnh` is a
+   minimal example, `games/dread` one with hooks.
+3. Most fixes belong in the engine, not the profile: missing services, NVN features and shader instructions are
+   shared by every game.
 
 ## Credits and licences
 
@@ -130,4 +172,5 @@ can be added with a mapping line in `gamecontrollerdb.txt` ([SDL_GameControllerD
 - [nxnative](https://github.com/seedds/nxnative)'s notes on Metroid Dread pointed at several of the bugs fixed here.
 - Third-party code in `third_party/`: Dear ImGui (MIT), SMAA (MIT), BIZ UDPGothic (SIL OFL) and DejaVu fonts (free
   licence) as stand-ins for the Switch's system fonts.
-- Metroid Dread is © Nintendo. This project is not affiliated with or endorsed by Nintendo.
+- Metroid Dread and Animal Crossing: New Horizons are © Nintendo. This project is not affiliated with or endorsed by
+  Nintendo.

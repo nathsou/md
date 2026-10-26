@@ -10,10 +10,19 @@
 
 #define SETTINGS_FILE settings_file()
 
-// LARECOMP_SETTINGS=<path>: another settings file (test runs never touch the player's dreadrecomp.ini)
+// LARECOMP_SETTINGS=<path>: another settings file (test runs never touch the player's nx.ini). An existing
+// dreadrecomp.ini (the name before nx ran more than Metroid Dread) is renamed on first use.
 static const char *settings_file(void) {
     const char *e = getenv("LARECOMP_SETTINGS");
-    return e && *e ? e : "dreadrecomp.ini";
+    if (e && *e) return e;
+    static int migrated;
+    if (!migrated) {
+        migrated = 1;
+        FILE *f = fopen("nx.ini", "r");
+        if (f) fclose(f);
+        else rename("dreadrecomp.ini", "nx.ini");
+    }
+    return "nx.ini";
 }
 
 
@@ -211,7 +220,7 @@ void settings_load(void) {
 void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
-    fprintf(f, "# Dread Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
+    fprintf(f, "# nx settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);

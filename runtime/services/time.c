@@ -1,4 +1,5 @@
 // time:u / time:a / time:s
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -9,7 +10,13 @@
 static const uint8_t clock_uuid[16] = {0x4c, 0x41, 0x52, 0x65, 0x63, 0x6f, 0x6d, 0x70, 1, 2, 3, 4, 5, 6, 7, 8};
 
 static int64_t steady_seconds(void) { return (int64_t)(rt_ticks() / 19200000ull); }
-static int64_t unix_now(void) { return (int64_t)time(NULL); }
+// LARECOMP_TIME_OFFSET=<seconds> (tests): the guest's clock runs that far from the host's (games that follow the time of
+// day: ACNH's lighting, shops)
+static int64_t unix_now(void) {
+    static int64_t off = -1;
+    if (off == -1) off = getenv("LARECOMP_TIME_OFFSET") ? atoll(getenv("LARECOMP_TIME_OFFSET")) : 0;
+    return (int64_t)time(NULL) + off;
+}
 
 static void write_system_context(uint8_t *p) {  // SystemClockContext (0x20)
     int64_t steady = steady_seconds();
@@ -56,11 +63,11 @@ static void steady_clock(Service *s, IpcReq *req, IpcResp *resp) {
     }
 }
 
-static void to_calendar(int64_t t, IpcResp *resp, int utc) {
+// CalendarTime (8 bytes) then CalendarAdditionalInfo (0x18) at o
+static void calendar_fill(uint8_t *o, int64_t t, int utc) {
     time_t tt = (time_t)t;
     struct tm tm;
     if (utc) gmtime_r(&tt, &tm); else localtime_r(&tt, &tm);
-    uint8_t *o = resp->data;
     *(uint16_t *)o = (uint16_t)(tm.tm_year + 1900);
     o[2] = (uint8_t)(tm.tm_mon + 1); o[3] = (uint8_t)tm.tm_mday;
     o[4] = (uint8_t)tm.tm_hour; o[5] = (uint8_t)tm.tm_min; o[6] = (uint8_t)tm.tm_sec;
@@ -77,14 +84,42 @@ static void to_calendar(int64_t t, IpcResp *resp, int utc) {
 #endif
     *(uint32_t *)(o + 24) = (uint32_t)tm.tm_isdst;
     *(int32_t *)(o + 28) = utc ? 0 : (int32_t)gmtoff;
+}
+static void to_calendar(int64_t t, IpcResp *resp, int utc) {
+    calendar_fill(resp->data, t, utc);
     resp_size(resp, 0x20);
+}
+
+// ClockSnapshot (0xD0): user / network SystemClockContexts, their times, calendar times and additional infos, the
+// steady clock's time point, the location name, automatic correction, type. ACNH's game clock reads it.
+static void clock_snapshot(uint8_t *o, uint8_t type) {
+    memset(o, 0, 0xD0);
+    int64_t now = unix_now();
+    write_system_context(o);
+    write_system_context(o + 0x20);
+    *(int64_t *)(o + 0x40) = now;
+    *(int64_t *)(o + 0x48) = now;
+    uint8_t cal[0x20];
+    calendar_fill(cal, now, 0);
+    memcpy(o + 0x50, cal, 8);
+    memcpy(o + 0x58, cal, 8);
+    memcpy(o + 0x60, cal + 8, 0x18);
+    memcpy(o + 0x78, cal + 8, 0x18);
+    *(int64_t *)(o + 0x90) = steady_seconds();
+    memcpy(o + 0x98, clock_uuid, 16);
+    memcpy(o + 0xA8, "UTC", 4);
+    o[0xCC] = 0;
+    o[0xCD] = type;
 }
 
 static void timezone_service(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
     switch (req->cmd) {
     case 0: memcpy(resp->data, "UTC", 4); resp_size(resp, 0x24); break;  // GetDeviceLocationName
-    case 100: to_calendar(IN(int64_t, 0), resp, 1); break;  // ToCalendarTime(rule buffer)
+    case 100:  // ToCalendarTime(rule buffer)
+        if (getenv("LARECOMP_LOG_TIME")) LOG("[time] ToCalendarTime(%lld)\n", (long long)IN(int64_t, 0));
+        to_calendar(IN(int64_t, 0), resp, 1);
+        break;
     case 101: to_calendar(IN(int64_t, 0), resp, 0); break;  // ToCalendarTimeWithMyRule
     case 201: {  // ToPosixTimeWithMyRule -> count + buffer of posix times
         const uint8_t *in = req->data;
@@ -119,6 +154,11 @@ static void static_service(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     }
     case 100: case 101: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;
+    case 400: case 401: {  // GetClockSnapshot(type) / GetClockSnapshotFromSystemClockContext(type, contexts): the buffer
+        IpcBuf *b = out_buf(req, 0);
+        if (b && b->size >= 0xD0) clock_snapshot((uint8_t *)(uintptr_t)b->addr, IN(uint8_t, 0));
+        break;
+    }
     default: LOG("[time] IStaticService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
     }
 }

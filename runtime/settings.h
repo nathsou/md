@@ -1,4 +1,4 @@
-// User settings (dreadrecomp.ini next to the executable's working directory), edited from the in-game menu.
+// User settings (nx.ini next to the executable's working directory), edited from the in-game menu.
 #pragma once
 #include <stdbool.h>
 

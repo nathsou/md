@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <dlfcn.h>
 #endif
 
@@ -36,14 +37,31 @@ static bool exists(const char *p) {
 }
 
 // The places to look, in order (gamelib.h). Returns how many were filled.
-static int candidates(const char *game_dir, char out[3][1100]) {
+#define MAX_CANDIDATES 32
+static int candidates(const char *game_dir, char out[MAX_CANDIDATES][1100]) {
     int n = 0;
     const char *env = getenv("LARECOMP_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
-    char exe_side[1024];
-    if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
-        snprintf(out[n++], 1100, "%s", exe_side);
-    if (game_dir) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
+    char exe[1024];
+    if (plat_exe_path(exe, sizeof exe)) {
+        char *slash = strrchr(exe, '/');
+#ifdef _WIN32
+        char *bs = strrchr(exe, '\\');
+        if (bs > slash) slash = bs;
+#endif
+        if (slash) *slash = 0;
+        snprintf(out[n++], 1100, "%s/%s", exe, GAMELIB_NAME);
+#ifndef _WIN32
+        DIR *d = opendir(exe);  // build/<game>/game.<ext>: every game built in this checkout
+        for (struct dirent *e; d && (e = readdir(d)) && n < MAX_CANDIDATES - 1;) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(out[n], 1100, "%s/%s/%s", exe, e->d_name, GAMELIB_NAME);
+            if (exists(out[n])) n++;
+        }
+        if (d) closedir(d);
+#endif
+    }
+    if (game_dir && n < MAX_CANDIDATES) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
     return n;
 }
 
@@ -51,7 +69,7 @@ bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char want[GAMELIB_FULL_ID_SIZE];
     if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
-    char c[3][1100];
+    char c[MAX_CANDIDATES][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
         if (exists(c[i]) && id_matches(c[i], want)) return true;
@@ -81,14 +99,14 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     static bool tried;
     if (!tried) {
         tried = true;
-        snprintf(g_error, sizeof g_error, "the game code hasn't been built: set up the game files on the start screen");
+        snprintf(g_error, sizeof g_error, "the game code for these game files hasn't been built (make gen GAME=<name> && make GAME=<name>)");
         char want[GAMELIB_FULL_ID_SIZE] = "";
         if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) {
             snprintf(g_error, sizeof g_error, "the game files' exefs/main is missing or unreadable");
             if (why) snprintf(why, why_size, "%s", g_error);
             return false;
         }
-        char c[3][1100];
+        char c[MAX_CANDIDATES][1100];
         int n = candidates(game_dir, c);
         const char *env = getenv("LARECOMP_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
@@ -99,8 +117,11 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                 continue;
             }
             g_tables = open_lib(c[i], want);
-            if (g_tables) LOG("[gamelib] %s (%llu + %llu functions)\n", c[i], (unsigned long long)*g_tables->main_count,
-                              (unsigned long long)*g_tables->sdk_count);
+            if (g_tables) {
+                uint64_t fns = 0;
+                for (uint32_t k = 0; k < g_tables->nmodules; k++) fns += *g_tables->modules[k].count;
+                LOG("[gamelib] %s (%u modules, %llu functions)\n", c[i], g_tables->nmodules, (unsigned long long)fns);
+            }
         }
     }
     if (!g_tables && why) snprintf(why, why_size, "%s", g_error);

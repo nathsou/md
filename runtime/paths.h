@@ -34,7 +34,7 @@ bool rt_data_root_early(char *out, size_t n);
 // Choosing another data folder (the start screen). NULL = it can be changed; else why not (rules 1 / 2).
 const char *rt_data_root_fixed(void);
 typedef struct {
-    char path[1100];               // where the data would go: the folder picked, or a "Dread Recomp" folder in it
+    char path[1100];               // where the data would go: the folder picked, or a "nx" folder in it
                                    // when it holds other things
     unsigned long long bytes;      // the data now (saves, seeds, settings, fonts, caches, game files)
     unsigned long long need, free; // space a move needs there (little on the same drive: hard links), space there

@@ -43,7 +43,42 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
         }
 }
 
-void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
+// LARECOMP_TRACE=<hex addr>[,...] (debugging): every entry of these guest functions is logged with its first
+// arguments, its return address and its thread (at most LARECOMP_TRACE_MAX lines, default 2000). Turns the entry hook
+// on for the whole run (a little slower).
+static uint64_t trace_addrs[64];
+static int trace_n = -1;
+static _Atomic int trace_lines, trace_max;
+
+static void trace_check(uint64_t a, Cpu *c) {
+    for (int i = 0; i < trace_n; i++) {
+        if (trace_addrs[i] != a) continue;
+        if (atomic_fetch_add(&trace_lines, 1) >= trace_max) return;
+        extern uint32_t kernel_current_thread_handle(void);
+        LOG("[trace] %llx(%llx, %llx, %llx, %llx, %llx) lr %llx thread %#x\n", (unsigned long long)a,
+            (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3],
+            (unsigned long long)c->x[4], (unsigned long long)c->x[30], kernel_current_thread_handle());
+        // LARECOMP_TRACE_DUMP=<n>:<bytes>: also the memory argument x<n> points to (guest memory only); with a hex
+        // address instead of n, that memory
+        static long long dreg = -2;
+        static int dlen;
+        if (dreg == -2) {
+            const char *d = getenv("LARECOMP_TRACE_DUMP");
+            if (!d || sscanf(d, "%lli:%i", &dreg, &dlen) != 2) dreg = -1;
+        }
+        uint64_t p = dreg >= 0 && dreg < 8 ? c->x[dreg] : dreg >= 8 ? (uint64_t)dreg : 0;
+        for (int o = 0; p >= GUEST_LO && p + dlen < GUEST_HI && o < dlen; o += 32) {
+            const uint64_t *q = (const uint64_t *)(uintptr_t)(p + o);
+            LOG("  %llx+%#04x: %016llx %016llx %016llx %016llx\n", (unsigned long long)p, o, (unsigned long long)q[0], (unsigned long long)q[1],
+                (unsigned long long)q[2], (unsigned long long)q[3]);
+        }
+    }
+}
+
+void fnprof_hit(uint64_t a, Cpu *c) {
+    if (trace_n > 0) trace_check(a, c);
+    if (g_fnprof < 2) return;  // (1: only tracing)
+    uint64_t lr = c->x[30], x0 = c->x[0];
     if (bt_n) bt_check(a, lr, x0);
     uint32_t h = (uint32_t)((a >> 2) * 0x9E3779B1u) & (NSLOT - 1);
     for (int n = 0; n < NSLOT; n++, h = (h + 1) & (NSLOT - 1)) {
@@ -68,9 +103,9 @@ void fnprof_frame(uint64_t frame) {
         if (e && sscanf(e, "%ld:%ld", &from, &to) != 2) from = -1;
     }
     if (from < 0) return;
-    if ((long)frame == from) { g_fnprof = 1; LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame); }
+    if ((long)frame == from) { g_fnprof = 2; LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame); }
     if ((long)frame != to) return;
-    g_fnprof = 0;
+    g_fnprof = trace_n > 0;
     uint64_t (*rows)[2] = malloc(sizeof(uint64_t[2]) * NSLOT);
     int n = 0;
     for (int i = 0; i < NSLOT; i++)
@@ -88,5 +123,13 @@ void fnprof_frame(uint64_t frame) {
 // LARECOMP_FNPROF=0:<to>: profile from process start (threads the game starts before the first frame)
 __attribute__((constructor)) static void fnprof_early(void) {
     const char *e = getenv("LARECOMP_FNPROF");
-    if (e && e[0] == '0' && e[1] == ':') g_fnprof = 1;
+    if (e && e[0] == '0' && e[1] == ':') g_fnprof = 2;
+    const char *t = getenv("LARECOMP_TRACE");
+    trace_n = 0;
+    for (char *p = (char *)t; p && *p && trace_n < 64;) {
+        trace_addrs[trace_n++] = strtoull(p, &p, 16);
+        while (*p == ',' || *p == ' ') p++;
+    }
+    trace_max = getenv("LARECOMP_TRACE_MAX") ? atoi(getenv("LARECOMP_TRACE_MAX")) : 2000;
+    if (trace_n > 0 && !g_fnprof) g_fnprof = 1;
 }

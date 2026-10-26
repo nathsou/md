@@ -1,4 +1,7 @@
-# LAS Recomp build
+# nx: a static recompilation engine for Switch games.
+#   make gen GAME=<name>   recompile data/<name>/exefs to C (generated/<name>/)
+#   make GAME=<name>       build the app (build/nx, shared by every game) and that game's code (build/<name>/game.*)
+#   ./build/nx data/<name>
 # macOS: Homebrew clang/SDL3/FFmpeg, Metal renderer.
 # Windows: MSYS2 UCRT64 shell (see docs/BUILD-windows.md), clang + Vulkan renderer.
 # Linux: clang + Vulkan renderer, x86-64 or aarch64 (see docs/linux.md).
@@ -12,25 +15,26 @@ else
 PLATFORM := macos
 endif
 
+# GAME: the game to generate / build (its files in GAME_DIR, default data/<GAME>: exefs/ and romfs/ from extract.mts)
+GAME     ?= dread
+GAME_DIR ?= data/$(GAME)
+
 # Linux: ARCH (x86_64 / aarch64, default this machine's) picks the target, separately from PLATFORM. The generated code
 # differs per arch (AArch64 hosts run the guest's FP/SIMD as inline asm, others use the portable C of simd.h), so a
 # cross build has its own generated-<arch>/ and build/<arch>/; SYSROOT is the target's root filesystem (headers, libs).
-GEN      ?= generated
+GENROOT  ?= generated
 ifeq ($(PLATFORM),linux)
 HOSTARCH := $(patsubst arm64,aarch64,$(shell uname -m))
 ARCH     ?= $(HOSTARCH)
 ifneq ($(ARCH),$(HOSTARCH))
 CROSS    := --target=$(ARCH)-linux-gnu $(if $(SYSROOT),--sysroot=$(SYSROOT))
-GEN      := generated-$(ARCH)
+GENROOT  := generated-$(ARCH)
 B        ?= build/$(ARCH)
 endif
 GENSIMD  := --simd $(if $(filter aarch64,$(ARCH)),asm,c)
 endif
 
-# Module load addresses: must match runtime/rt.h MAIN_BASE / SDK_BASE (the generated code has them built in)
-MAIN_BASE := $(shell sed -n 's/^\#define MAIN_BASE *\(0x[0-9a-fA-F]*\).*/\1/p' runtime/rt.h)
-SDK_BASE  := $(shell sed -n 's/^\#define SDK_BASE *\(0x[0-9a-fA-F]*\).*/\1/p' runtime/rt.h)
-SUBSDK0_BASE := $(shell sed -n 's/^\#define SUBSDK0_BASE *\(0x[0-9a-fA-F]*\).*/\1/p' runtime/rt.h)
+GEN      := $(GENROOT)/$(GAME)
 
 # B: build dir. MACOS_MIN: oldest macOS to run on (default: this one). DEPS: prefix with SDL3 / FFmpeg instead of
 # Homebrew's (make deps). `make app` sets all three (build/mac15, 15.0, build/deps); plain `make` uses none.
@@ -43,15 +47,18 @@ CXX      := clang++ $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
-# The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
-# the app itself holds none of it
+# The game code (made by `make gen` from your own game files) is its own library, build/<game>/game.<ext>
+# (runtime/gamelib.h); the app holds none of it and loads the one built for the game files it is given.
 # (strip: with no generated code the space between the two would be all that's left, and $(if) takes a lone space as
 # true. No comment after the value: make keeps the spaces before it)
-GEN_SRC  := $(strip $(wildcard $(GEN)/main/*.c) $(wildcard $(GEN)/sdk/*.c) $(wildcard $(GEN)/subsdk0/*.c))
-GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
+GEN_SRC  := $(strip $(wildcard $(GEN)/*/*.c) $(wildcard $(GEN)/gamelib_modules.c))
+GB       := $(B)/$(GAME)
+GEN_OBJ  := $(patsubst %.c,$(GB)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(GB)/obj/tools/gamelib_entry.o
+# The engine, and every game profile (games/<id>/*.c: they register themselves, runtime/game.h)
 RT_SRC   := $(wildcard runtime/*.c runtime/*.cpp) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
-            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
-RT_HDRS  := $(wildcard runtime/*.h runtime/game_addresses/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
+            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c \
+            $(wildcard games/*/*.c)
+RT_HDRS  := $(wildcard runtime/*.h games/*/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
@@ -61,19 +68,20 @@ IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.
 ifeq ($(PLATFORM),macos)
 SDL      := $(or $(DEPS),/opt/homebrew/opt/sdl3)
 FFMPEG   := $(or $(DEPS),/opt/homebrew/opt/ffmpeg)
-EXE      := $(B)/dreadrecomp
-DEPINC   := -I$(SDL)/include -I$(FFMPEG)/include
+ZSTD     := $(or $(DEPS),/opt/homebrew/opt/zstd)
+EXE      := $(B)/nx
+DEPINC   := -I$(SDL)/include -I$(FFMPEG)/include -I$(ZSTD)/include
 LDFLAGS  := -L$(SDL)/lib -lSDL3 -Wl,-rpath,$(SDL)/lib -L$(FFMPEG)/lib -lavformat -lavcodec -lavutil -lswscale -Wl,-rpath,$(FFMPEG)/lib \
+            -L$(ZSTD)/lib -lzstd -Wl,-rpath,$(ZSTD)/lib \
             -framework CoreFoundation -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore -framework AppKit -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
 BACKEND_SRC := $(wildcard runtime/nvn/*.m)
 BACKEND_OBJ := $(patsubst runtime/%.m,$(B)/rt/%.o,$(BACKEND_SRC))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_metal.o
 UIFLAGS  := -fobjc-arc
-GAMELIB  := $(B)/dreadgame.dylib
+GAMELIB  := $(GB)/game.dylib
 GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup  # (the runtime functions it calls: the app's own)
-GAMELIB_SHARED := -shared -Wl,-undefined,dynamic_lookup  # (the same, for the start screen's build: zig cc)
 else ifeq ($(PLATFORM),linux)
-EXE      := $(B)/dreadrecomp
+EXE      := $(B)/nx
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
@@ -84,23 +92,22 @@ OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the 
 # without one -lshaderc (Debian / Ubuntu's libshaderc.so). SHADERC=... overrides it.
 SHADERC  ?= $(shell pkg-config --libs shaderc 2>/dev/null || echo -lshaderc)
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
-LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
+LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd \
             -lvulkan $(SHADERC) -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
-GAMELIB  := $(B)/dreadgame.so
+GAMELIB  := $(GB)/game.so
 GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the app's own, -rdynamic)
-GAMELIB_SHARED := -shared
 else
-EXE      := $(B)/dreadrecomp.exe
+EXE      := $(B)/nx.exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
             $(if $(RELEASE),-DLARECOMP_ZIP_BUILD)  # (the log's [info] line: the release zip)
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); override for older CPUs
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
-LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
+LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd \
             -lvulkan-1 -lws2_32 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> lasrecomp.log + lasrecomp-backup-*.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
@@ -109,52 +116,53 @@ BACKEND_OBJ += $(B)/rt/platform/windows_rc.o  # the .exe's icon (Explorer, taskb
 WINDRES  ?= windres
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++ $(OSFLAGS)  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
-GAMELIB  := $(B)/dreadgame.dll
+GAMELIB  := $(GB)/game.dll
 # the runtime functions it calls: exported by the .exe, linked through its import library
-LDFLAGS  += -Wl,--export-all-symbols -Wl,--out-implib,$(B)/dreadrecomp.dll.a
-GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(B)/dreadrecomp.dll.a
-GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
+LDFLAGS  += -Wl,--export-all-symbols -Wl,--out-implib,$(B)/nx.dll.a
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(B)/nx.dll.a
 endif
 
-# GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
-# flags). A library with another id is rebuilt by the start screen, never loaded.
-GAMELIB_SRCS := tools/game_addresses.py runtime/game_addresses/versions.h $(wildcard runtime/game_addresses/patches_v*.h) tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
+# GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the flags):
+# the same for every game, so one app loads them all. A library with another id is never loaded. (A game's own
+# patches change its generated code: `make gen` again after editing games/<id>/patches*.)
+GAMELIB_SRCS := tools/games.py tools/gen_game.py tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
-GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
-# The library's own id adds the game's main build ID (what `make gen` generated from: $(GEN)/main/main_build_id.txt),
-# so game code for another game version is never loaded (runtime/gamelib.h gamelib_full_id)
-GAMELIB_BUILD := $(shell cut -c1-16 $(GEN)/main/main_build_id.txt 2>/dev/null)
+# (of runtime/rt.h, only the module layout's constants: tools/gen_game.py)
+GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); grep -E '^.define (MAIN_BASE|HLE_BASE)' runtime/rt.h; echo '$(GENFLAGS)') | \
+                (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+# The library's own id adds the game's main build ID (what `make gen` generated from: $(GEN)/main_build_id.txt), so
+# the app picks the library built for the game files it is given (runtime/gamelib.h gamelib_full_id)
+GAMELIB_BUILD := $(shell cut -c1-16 $(GEN)/main_build_id.txt 2>/dev/null)
 GAMELIB_FULL_ID := $(GAMELIB_ID)-$(or $(GAMELIB_BUILD),unknown)
-# GAMELIB_BASE_ID: what every compiled piece of it depends on (the headers, the flags, the pinned compiler). The same
-# base keeps the start screen's earlier build pieces: only the pieces whose generated C changed are compiled again
-# (runtime/gamebuild.c). Another base: everything is compiled again.
-GAMELIB_BASE_SRCS := runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/fetch_zig.sh
-GAMELIB_BASE_ID := $(shell (cat $(GAMELIB_BASE_SRCS); echo '$(GENFLAGS) $(GAMELIB_SHARED)') | \
-                     (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
-RT_OBJ   := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)))
-RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
+RT_OBJ   := $(patsubst games/%.c,$(B)/rt/games/%.o,$(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))))
+RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -I. $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
 
 all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
-$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
+$(GB)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
 	@mkdir -p $(dir $@)
 	@$(CC) $(GENFLAGS) -c $< -o $@
 
-$(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) $(wildcard $(GEN)/main/main_build_id.txt)
+# (the id in a file that changes only when the id does: make doesn't see a changed -D value)
+$(B)/gamelib_id.stamp: FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(GAMELIB_ID)' | cmp -s - $@ || echo '$(GAMELIB_ID)' > $@
+FORCE:
+$(GB)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) $(B)/gamelib_id.stamp $(wildcard $(GEN)/main_build_id.txt)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_FULL_ID)"' -c $< -o $@
-$(B)/rt/gamelib.o: $(GAMELIB_SRCS)
+# (the app's side: the generator id the libraries it loads must have; the game's build ID is added at run time)
+$(B)/rt/gamelib.o: $(GAMELIB_SRCS) $(B)/gamelib_id.stamp
 $(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
-# the start screen's build of it (runtime/gamebuild.c) uses the same flags
-$(B)/rt/gamebuild.o: $(GAMELIB_SRCS) $(GAMELIB_BASE_SRCS) Makefile
-$(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_BASE_ID='"$(GAMELIB_BASE_ID)"' \
-                                -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
-                                -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
 
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(RTFLAGS) -c $< -o $@
+
+$(B)/rt/games/%.o: games/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(RTFLAGS) -c $< -o $@
 
@@ -167,11 +175,17 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
 
-# The shader preparation's variant list (runtime/nvn/shader_prep.h: no shader code, hashes and pipeline state only)
-# as a C string for runtime/nvn/shader_prep.c
-$(B)/inc/shader_variants.inc: runtime/nvn/shader_variants.txt
+# The shader preparation's variant lists (runtime/nvn/shader_prep.h: no shader code, hashes and pipeline state only),
+# one per game (games/<id>/shader_variants.txt, recorded in checkpoint runs: LARECOMP_RECORD_KEYS), as a table of C
+# strings for runtime/nvn/shader_prep.c
+VARIANT_LISTS := $(wildcard games/*/shader_variants.txt)
+$(B)/inc/shader_variants.inc: $(VARIANT_LISTS) Makefile
 	@mkdir -p $(dir $@)
-	(LC_ALL=C tr -d '\r' < $< | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/'; echo '""') > $@
+	@: > $@
+	@for f in $(VARIANT_LISTS); do id=$$(basename $$(dirname $$f)); \
+	    echo "{\"$$id\"," >> $@; \
+	    LC_ALL=C tr -d '\r' < $$f | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' >> $@; \
+	    echo '""},' >> $@; done
 $(B)/rt/nvn/shader_prep.o: $(B)/inc/shader_variants.inc
 $(B)/rt/nvn/shader_prep.o: RTFLAGS += -I$(B)/inc
 # the shader translator's id: part of the shader caches' tag (shader_cache_tag), so a changed translator rebuilds them
@@ -218,15 +232,11 @@ $(B)/imgui/imgui_impl_metal.o: $(IMGUI)/backends/imgui_impl_metal.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
 
-# Python: tools/venv (macOS, Linux: bin/python, Windows: Scripts/python.exe)
+# Python: .venv (macOS, Linux: bin/python, Windows: Scripts/python.exe)
 PY := $(firstword $(wildcard .venv/bin/python) $(wildcard .venv/Scripts/python.exe) $(wildcard tools/venv/bin/python))
-# GAME: the folder holding the extracted exefs/ and romfs/ (default: this one)
-GAME ?= .
 
 gen:
-	cd tools && ../$(PY) gen.py sdk $(abspath $(GAME))/exefs/sdk $(SDK_BASE) ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
-	cd tools && ../$(PY) gen.py subsdk0 $(abspath $(GAME))/exefs/subsdk0 $(SUBSDK0_BASE) ../$(GEN)/subsdk0 $(GENSIMD)
-	cd tools && ../$(PY) gen.py main $(abspath $(GAME))/exefs/main $(MAIN_BASE) ../$(GEN)/main $(GENSIMD)
+	$(PY) tools/gen_game.py $(GAME_DIR) $(GEN) $(GENSIMD)
 
 gen-objs: $(GEN_OBJ)
 
@@ -237,130 +247,22 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico ru
 	@mkdir -p $(dir $@)
 	$(WINDRES) -I docs/icon -I runtime/platform -O coff $< -o $@
 
-VERSION  := $(shell sed -n 's/^\#define DREADRECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/menu.mm)
-
-# macOS: build/LAS Recomp.app, runs on macOS $(APP_MIN)+: the game rebuilt for that in build/mac15 against build/deps
-# (`make deps`: SDL3, LGPL FFmpeg, keystone, Python, from pinned sources), the generator helper when built
-# (`make rando-helper` after `make deps`), packaged by tools/bundle_macos.sh. No game files or fonts.
-APP_MIN  := 15.0
-APP_B    := build/mac15
-deps:
-	MACOS_MIN=$(APP_MIN) tools/build_deps_macos.sh
-app:
-	@[ -f build/deps/lib/libSDL3.0.dylib ] || { echo "make deps first"; exit 1; }
-	$(MAKE) B=$(APP_B) MACOS_MIN=$(APP_MIN) DEPS=$(CURDIR)/build/deps $(APP_B)/lasrecomp
-	MACOS_MIN=$(APP_MIN) tools/bundle_macos.sh $(APP_B)/lasrecomp
-
-# macOS release disk image (the .app + an Applications shortcut to drag it onto): build/dist/LAS Recomp-<v>-macOS.dmg
-dmg: app
-	tools/make_dmg.sh
-
-# Windows: build/dist/LAS Recomp-<version>-windows.zip, top folder "LAS Recomp/": the exe, the seed generator
-# helper (make rando-helper), what the start screen builds the game code with on the player's machine (make gen-helper,
-# tools/fetch_zig.sh slimmed by tools/zig_slim.sh: its runtime built ahead of time, gamelib-src/, the exe's import library)
-# and the DLLs they load (runs without MSYS2). No game code. The exe is a release build in $(WIN_B):
-# linked against the LGPL FFmpeg from `make deps-windows` (MSYS2's is a GPLv3 build) and without a console window
-# (RELEASE=1: the log goes next to the exe - lasrecomp.log is the latest run, plus up to five recent
-# lasrecomp-backup-*.log - and fatal errors show a message box). Its DLLs are looked up
-# with build/deps-win/bin first (the FFmpeg DLL names are the same as MSYS2's GPL ones). vulkan-1.dll is left
-# out: every Vulkan driver installs the loader in System32. Saves, seeds and game files go next to the exe at run time.
-# Needs: Windows 10+ x64, a Vulkan 1.3 driver, an AVX2 CPU (GENARCH x86-64-v3; checked at startup).
-DIST     := build/dist/LAS Recomp
-WIN_B    := build/win-release
-deps-windows:
-	tools/build_deps_windows.sh
-dist:
-	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
-	@[ -d build/helper/rando-gen ] || { echo "make rando-helper first (the seed generator)"; exit 1; }
-	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
-	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
-	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 $(WIN_B)/lasrecomp.exe
-	! nm $(WIN_B)/lasrecomp.exe | grep ' f_70' >/dev/null  # (no game code inside)
-	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
-	cp $(WIN_B)/lasrecomp.exe $(WIN_B)/dreadrecomp.dll.a "$(DIST)/"
-	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS)))  # (zig with its runtime built ahead of time)
-	cp -R build/helper/lasgen "$(DIST)/"
-	cp -R build/zig-slim "$(DIST)/zig"
-	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
-	    "$(DIST)/gamelib-src/"
-	cp docs/icon/icon_1024.png "$(DIST)/icon.png"
-	cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$(DIST)/"  # (start screen font, OFL)
-	cp third_party/fonts/Baloo2/OFL.txt "$(DIST)/Baloo2-OFL.txt"
-	cp third_party/fonts/DejaVu/DejaVuSans.ttf third_party/fonts/DejaVu/DejaVuSans-Bold.ttf "$(DIST)/"  # (last-resort fonts, free license)
-	cp third_party/fonts/DejaVu/LICENSE "$(DIST)/DejaVu-LICENSE.txt"
-	cp README.md LICENSE "$(DIST)/"  # (licenses and source links of the bundled components: README "License")
-	cp -R build/helper/rando-gen "$(DIST)/"
-	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/lasrecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
-	    xargs -I{} cp -u {} "$(DIST)/"
-	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
-	cd build/dist && if command -v zip >/dev/null; then zip -qr "LAS Recomp-$(VERSION)-windows.zip" "LAS Recomp"; \
-	    else /c/Windows/System32/tar.exe -a -cf "LAS Recomp-$(VERSION)-windows.zip" "LAS Recomp"; fi
-	@echo "build/dist/LAS Recomp-$(VERSION)-windows.zip"
-
-# Seed generator as a standalone helper, so players need no Python: build/helper/rando-gen/ (rando-gen[.exe] +
-# _internal/), frozen by PyInstaller from tools/rando/rando_gen.spec in its own venv (build/rando-venv). Ship the
-# rando-gen folder next to the exe (Windows) or as "LAS Recomp.app"/Contents/Resources/rando-gen (runtime/ui/rando_tab.mm
-# generator_cmd). PyInstaller only builds for the OS it runs on.
-# macOS arm64: the relocatable Python 3.12 and keystone from `make deps` (macOS 11+ / 15+: the helper runs where the
-#   app does); without them Homebrew's python@3.12 and keystone (then only on the macOS they were built for). The
-#   keystone wheel has no dylib: KEYSTONE_LIB tells rando_gen.spec which one to take.
-# Windows x86-64 (untested): from the MSYS2 shell with a python.org CPython 3.12 (MSYS2's Python has no oead wheel),
-#   e.g. make rando-helper RANDO_PY="/c/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe"
-ifeq ($(PLATFORM),macos)
-RANDO_PY  ?= $(firstword $(wildcard build/deps/python/bin/python3.12) python3.12)
-export KEYSTONE_LIB ?= $(wildcard $(CURDIR)/build/deps/lib/libkeystone.dylib)
-RANDO_VPY := build/rando-venv/bin/python
-else
-RANDO_PY  ?= py -3.12
-RANDO_VPY := build/rando-venv/Scripts/python.exe
-endif
-
-rando-helper: build/rando-venv/.ok
-	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
-	$(RANDO_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
-	    tools/rando/rando_gen.spec
-	@du -sh build/helper/rando-gen
-
-# The game code generator, the same way (tools/lasgen.spec): build/helper/lasgen/, shipped as lasgen/ next to the exe or
-# in Contents/Resources. The start screen's setup runs it on the player's own game files (runtime/gamebuild.c).
-gen-helper: build/rando-venv/.ok build/rando-venv/.gen-ok
-	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
-	$(RANDO_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
-	    tools/lasgen.spec
-	$(if $(filter windows,$(PLATFORM)),$(RANDO_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
-	@du -sh build/helper/lasgen
-
-build/rando-venv/.gen-ok: build/rando-venv/.ok
-	$(RANDO_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5
-	touch $@
-
-build/rando-venv/.ok: third_party/LAS-Randomizer/requirements.txt
-	$(RANDO_PY) -m venv build/rando-venv
-	$(RANDO_VPY) -m pip install -q -r third_party/LAS-Randomizer/requirements.txt pyinstaller==6.22.3
-	touch $@
-
-# Linux: build/dist/LAS Recomp-<version>-linux-<arch>.AppImage, built in Ubuntu 22.04 containers (podman) with SDL3, LGPL
-# FFmpeg, shaderc and the seed generator helper inside; the Vulkan loader and GPU drivers are the system's.
-# `make appimage` (ARCH: this machine's, or aarch64 cross-compiled), `make appimages` both. See docs/linux.md.
-appimage:
-	tools/linux/appimage.sh $(ARCH)
-appimages:
-	tools/linux/appimage.sh x86_64
-	tools/linux/appimage.sh aarch64
-# release check of the x86-64 AppImage: start screen, into the game, warps to the overworld and every dungeon
-smoketest:
-	tools/linux/smoketest.sh
-
-.PHONY: dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest
+.PHONY: all gen gen-objs runtime-objs FORCE
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c
 
 # Every shader the game ships (romfs/system/shd), translated and compiled with Metal: no game needed to run
 # (tools/shader_corpus.m). `make corpus` (MSL + Metal) - add CORPUS_ARGS=--glsl for the Vulkan GLSL translation.
-build/shader_corpus: tools/shader_corpus.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
+build/shader_corpus: tools/shader_corpus.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/yaz0.h
 	@mkdir -p $(dir $@)
-	clang -O1 -fobjc-arc -framework Metal -framework Foundation -Iruntime/nvn/maxwell tools/shader_corpus.m runtime/nvn/maxwell/translate.c -o $@
-corpus: build/shader_corpus
-	build/shader_corpus $(GAME)/romfs/system/shd $(CORPUS_ARGS)
+	clang -O1 -fobjc-arc -framework Metal -framework Foundation -Iruntime/nvn/maxwell -Iruntime/nvn -I/opt/homebrew/opt/zstd/include \
+	    tools/shader_corpus.m runtime/nvn/maxwell/translate.c -o $@ -L/opt/homebrew/opt/zstd/lib -lzstd
+# Then the game's prepared pipelines into its Metal binary archive (cache/<game>/shaders.metalarchive: nx in
+# preparation-only mode, games/<id>/shader_variants.txt and the shaders found in the game files), which the game loads.
+# (the archive is built even when the check finds shaders it can't translate - ACNH's agl debug shaders - and corpus
+# fails after it then; SKIP_CHECK=1: the archive alone)
+corpus: build/shader_corpus $(EXE)
+	@rc=0; [ -n "$(SKIP_CHECK)" ] || build/shader_corpus $(GAME_DIR)/romfs $(CORPUS_ARGS) || rc=$$?; \
+	LARECOMP_SHADER_PREP_ONLY=1 LARECOMP_NO_LAUNCHER=1 LARECOMP_NO_AUDIO=1 $(EXE) $(GAME_DIR) && exit $$rc
 .PHONY: corpus

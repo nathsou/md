@@ -104,7 +104,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
-    bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
+    bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane, uses_point_coord;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
@@ -312,7 +312,7 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 } else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
             }
         } else if (addr == 0x3FC) { c->uses_front_facing = true; strcpy(e, "(front_facing ? 0xFFFFFFFFu : 0u)"); }
-        else if (addr == 0x2E0 || addr == 0x2E4) { sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
+        else if (addr == 0x2E0 || addr == 0x2E4) { c->uses_point_coord = true; sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
         else { sprintf(e, "0u /* attr %#x */", addr); }
     } else {
         sprintf(e, "0u /* attr %#x */", addr);
@@ -541,6 +541,16 @@ static const char *tex_type_name(int t) {
 
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
+    if (strstr(call, "sample_compare") && getenv("LARECOMP_SHADOW_ONE")) call = "float4(1.0f)";  // (debug: no shadows)
+    {   // (debug) LARECOMP_TEX_CONST=<slot>:<value>: fragment lookups on that slot give that value
+        const char *e = getenv("LARECOMP_TEX_CONST");
+        int ts; float tv;
+        static char cbuf[64];
+        if (e && c->stage == STAGE_FRAGMENT && sscanf(e, "%d:%f", &ts, &tv) == 2 && ts == slot) {
+            snprintf(cbuf, sizeof cbuf, "float4(%ff)", tv);
+            call = cbuf;
+        }
+    }
     sp(&c->body, "    { float4 t = %s;\n", call);
     (void)slot;
     if (f16) {
@@ -637,7 +647,9 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         else snprintf(xs, sizeof xs, "vec2(%s, %s)", co[0], co[1]);
         if (c->stage != STAGE_VERTEX) { char w[1700]; snprintf(w, sizeof w, "uvs(%s, rscale[%d])", xs, slot + 1); strcpy(xs, w); c->uses_rscale = true; }
     } else {
-        if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
+        if (off && !cube && !layer)  // (3D)
+            snprintf(xs, sizeof xs, "(vec3(%s, %s, %s) + vec3(%s) / vec3(tsize%d(%s).xyz))", co[0], co[1], co[2], off, slot, L);
+        else if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
     }
     const char *extra = NULL;  // separate compare argument (cube array shadow)
@@ -777,13 +789,13 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
         case 9: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, true, true);
             sprintf(call, "float4(t%d.sample_compare(s%d, %s, %s, %s, level(0)))", slot, slot, UV2(slot, F(A1), F(Bv)), A, F(B1)); break;
         case 10: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
-            sprintf(call, "t%d.sample(s%d, float3(%s, %s, %s))", slot, slot, F(A), F(A1), F(Bv)); break;
+            sprintf(call, "t%d.sample(s%d, nn3(float3(%s, %s, %s)))", slot, slot, F(A), F(A1), F(Bv)); break;
         case 11: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
-            sprintf(call, "t%d.sample(s%d, float3(%s, %s, %s), level(0))", slot, slot, F(A), F(A1), F(Bv)); break;
+            sprintf(call, "t%d.sample(s%d, nn3(float3(%s, %s, %s)), level(0))", slot, slot, F(A), F(A1), F(Bv)); break;
         case 12: slot = tex_slot(c, index, TEXTYPE_CUBE, false, false);
-            sprintf(call, "t%d.sample(s%d, float3(%s, %s, %s))", slot, slot, F(A), F(A1), F(Bv)); break;
+            sprintf(call, "t%d.sample(s%d, nn3(float3(%s, %s, %s)))", slot, slot, F(A), F(A1), F(Bv)); break;
         case 13: slot = tex_slot(c, index, TEXTYPE_CUBE, false, false);
-            sprintf(call, "t%d.sample(s%d, float3(%s, %s, %s), level(%s))", slot, slot, F(A), F(A1), F(Bv), F(B1)); break;
+            sprintf(call, "t%d.sample(s%d, nn3(float3(%s, %s, %s)), level(%s))", slot, slot, F(A), F(A1), F(Bv), F(B1)); break;
         default: fail(c, "texs info %d", info); return;
         }
     } else {
@@ -841,7 +853,13 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
             lk = 1;
             lodp = "0.0f";
         }
-        if (aoffi) { c->reg_used[p2] = 1; sprintf(offv, "int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", p2, p2); offp = offv; p2++; }
+        if (aoffi) {  // (signed 4-bit fields: x, y, and z for 3D)
+            c->reg_used[p2] = 1;
+            if (ncoord == 3) sprintf(offv, "ivec3(int(r%d << 28) >> 28, int(r%d << 24) >> 28, int(r%d << 20) >> 28)", p2, p2, p2);
+            else sprintf(offv, "ivec2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", p2, p2);
+            offp = offv;
+            p2++;
+        }
         if (dc) { c->reg_used[p2] = 1; sprintf(drv, "as_type<float>(r%d)", p2); drp = drv; p2++; }
         glsl_sample(c, gcall, slot, co, layp, drp, lk, lodp, offp);
         write_tex_result(c, slot, gcall, mask, d, RZ, false, false);
@@ -865,15 +883,17 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     } else if (lod_mode == 1) {
         strcpy(lod, ", level(0)");
     }
-    if (aoffi) {
+    if (aoffi) {  // (signed 4-bit fields: x, y, and z for 3D)
         c->reg_used[pr] = 1;
-        sprintf(off, ", int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", pr, pr);
+        if (ncoord == 3) sprintf(off, ", int3(int(r%d << 28) >> 28, int(r%d << 24) >> 28, int(r%d << 20) >> 28)", pr, pr, pr);
+        else sprintf(off, ", int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", pr, pr);
         pr++;
     }
     if (dc) { c->reg_used[pr] = 1; sprintf(dref, "as_type<float>(r%d)", pr); pr++; }
     const char *vec = ncoord == 1 ? "" : ncoord == 2 ? "float2" : "float3";
     char cexpr[420], call[1024];
     if (ncoord == 2 && c->stage != STAGE_VERTEX) { snprintf(cexpr, sizeof cexpr, "uvs(float2(%s), rscale[%d])", coords, slot + 1); c->uses_rscale = true; }
+    else if (ncoord == 3) snprintf(cexpr, sizeof cexpr, "nn3(float3(%s))", coords);
     else snprintf(cexpr, sizeof cexpr, "%s(%s)", vec, coords);
     if (dc)
         sprintf(call, "float4(t%d.sample_compare(s%d, %s%s%s, %s%s%s))", slot, slot, cexpr, array ? ", " : "",
@@ -940,6 +960,107 @@ static void emit_txd(Ctx *c, uint64_t w) {
                 b, b + 2, slot + 1, b + 1, b + 3, slot + 1, off);
     }
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TMML: the level of detail a lookup at these coordinates would use (yuzu's texture_mipmap_level.cpp has the layout):
+// coordinates from register A (array types: the index first, then the coordinates), the result as 8.8 fixed point - x
+// the level the lookup would access (clamped to the texture's levels), y the computed one (unclamped, signed).
+// Fragment stages only (the derivatives come from the quad); elsewhere 0, the level a vertex lookup uses.
+static void emit_tmml(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int ttype = (int)bits(w, 28, 3);  // 0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D, 6 cube
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    if (ttype != 2 && ttype != 3) { fail(c, "tmml: dimension %d", ttype); return; }
+    bool array = ttype & 1;
+    int type = array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D;
+    int slot = tex_slot(c, index, type, false, array);
+    int u = array ? a + 1 : a;
+    c->reg_used[a] = c->reg_used[u] = c->reg_used[u + 1] = 1;
+    c->uses_rscale = true;
+    if (c->stage != STAGE_FRAGMENT)
+        sp(&c->body, "    { float2 lod = float2(0.0f);\n");
+    else if (c->glsl)
+        sp(&c->body, "    { vec2 lod = textureQueryLod(t%d, uvs(vec2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d]));\n",
+           slot, u, u + 1, slot + 1);
+    else
+        sp(&c->body, "    { float2 uv = uvs(float2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d]);\n"
+           "      float2 lod = float2(t%d.calculate_clamped_lod(s%d, uv), t%d.calculate_unclamped_lod(s%d, uv));\n",
+           u, u + 1, slot + 1, slot, slot, slot, slot);
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!(mask & (1u << i))) continue;
+        c->reg_used[d + n] = 1;
+        if (i == 0) sp(&c->body, c->glsl ? "      r%d = uint(max(lod.x, 0.0) * 256.0);\n" : "      r%d = uint(max(lod.x, 0.0f) * 256.0f);\n", d + n);
+        else if (i == 1) sp(&c->body, c->glsl ? "      r%d = uint(int(lod.y * 256.0));\n" : "      r%d = as_type<uint>(int(lod.y * 256.0f));\n", d + n);
+        else sp(&c->body, "      r%d = 0u;\n", d + n);
+        n++;
+    }
+    sp(&c->body, "    }\n");
+}
+
+// TLD4: a gather (the four texels a bilinear lookup would read, one component of each; yuzu's texture_gather.cpp has
+// the layout). Coordinates from register A (array types: the index first); register B holds the texel offset (AOFFI:
+// signed 6-bit x at bit 0, y at bit 8) then the depth reference (DC). Component at 56, offset mode at 54, DC at 50.
+static void emit_tld4(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int ttype = (int)bits(w, 28, 3);  // 2 2D, 3 2D array, 6 cube, 7 cube array
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    int comp = (int)bits(w, 56, 2), offmode = (int)bits(w, 54, 2);
+    bool dc = bits(w, 50, 1);
+    if (c->glsl) { fail(c, "tld4: glsl"); return; }
+    if (offmode == 2) { fail(c, "tld4: per-texel offsets"); return; }
+    if (ttype != 2 && ttype != 3 && ttype != 6 && ttype != 7) { fail(c, "tld4: dimension %d", ttype); return; }
+    bool array = ttype & 1, cube = ttype >= 6;
+    int type = cube ? (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE) : (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D);
+    int slot = tex_slot(c, index, type, dc, array);
+    int u = array ? a + 1 : a, n = cube ? 3 : 2, pb = b;
+    char coord[256], layer[96] = "", off[128] = "", dref[64] = "";
+    for (int i = u; i < u + n; i++) c->reg_used[i] = 1;
+    if (array) { c->reg_used[a] = 1; sprintf(layer, ", min(uint(r%d), t%d.get_array_size() - 1u)", a, slot); }
+    if (cube) sprintf(coord, "float3(as_type<float>(r%d), as_type<float>(r%d), as_type<float>(r%d))", u, u + 1, u + 2);
+    else {
+        c->uses_rscale = true;
+        sprintf(coord, c->stage != STAGE_VERTEX ? "uvs(float2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d])"
+                                                : "float2(as_type<float>(r%d), as_type<float>(r%d))", u, u + 1, slot + 1);
+    }
+    if (offmode == 1 && !cube) {
+        c->reg_used[pb] = 1;
+        sprintf(off, ", int2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pb, pb);
+        pb++;
+    }
+    if (dc) { c->reg_used[pb] = 1; sprintf(dref, "as_type<float>(r%d)", pb); }
+    static const char *const cn[] = {"x", "y", "z", "w"};
+    char call[1024];
+    if (dc) sprintf(call, "t%d.gather_compare(s%d, %s%s, %s%s)", slot, slot, coord, layer, dref, off);
+    else sprintf(call, "t%d.gather(s%d, %s%s%s%s, component::%s)", slot, slot, coord, layer, off[0] ? off : "",
+                 off[0] || cube ? "" : ", int2(0)", cn[comp]);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TLD4S: the scalar-register gather (2D): with an offset or a depth reference, coordinates from A and A+1 and the
+// offset / reference from B; otherwise u from A, v from B. All four results: two in D0 (and D0+1), two in D1.
+static void emit_tld4s(Ctx *c, uint64_t w) {
+    int d0 = (int)bits(w, 0, 8), d1 = (int)bits(w, 28, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    bool dc = bits(w, 50, 1), aoffi = bits(w, 51, 1), f16 = bits(w, 55, 1);
+    int comp = (int)bits(w, 52, 2);
+    if (c->glsl) { fail(c, "tld4s: glsl"); return; }
+    int slot = tex_slot(c, index, TEXTYPE_2D, dc, false);
+    char coord[256], off[128] = "", dref[64] = "";
+    int ua = a, va = (aoffi || dc) ? a + 1 : b, pb = b;
+    c->reg_used[ua] = c->reg_used[va] = 1;
+    c->uses_rscale = true;
+    sprintf(coord, c->stage != STAGE_VERTEX ? "uvs(float2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d])"
+                                            : "float2(as_type<float>(r%d), as_type<float>(r%d))", ua, va, slot + 1);
+    if (aoffi) { c->reg_used[pb] = 1; sprintf(off, ", int2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pb, pb); pb++; }
+    if (dc) { c->reg_used[pb] = 1; sprintf(dref, "as_type<float>(r%d)", pb); }
+    static const char *const cn[] = {"x", "y", "z", "w"};
+    char call[1024];
+    if (dc) sprintf(call, "t%d.gather_compare(s%d, %s, %s%s)", slot, slot, coord, dref, off);
+    else sprintf(call, "t%d.gather(s%d, %s%s, component::%s)", slot, slot, coord, off[0] ? off : ", int2(0)", cn[comp]);
+    write_tex_result(c, slot, call, 0xF, d0, d1, true, f16);
 }
 
 // ------------------------------------------------------------------ instruction translation
@@ -1099,6 +1220,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_txd(c, w);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xdf58000000000000ull, 0xfff8000000000000ull)) {  // TMML
+        emit_tmml(c, w);
+    } else if (OPM(0xc838000000000000ull, 0xfc38000000000000ull)) {  // TLD4
+        emit_tld4(c, w);
+    } else if (OPM(0xdf00000000000000ull, 0xffc0000000000000ull)) {  // TLD4S
+        emit_tld4s(c, w);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
         int qt = (int)bits(w, 22, 6);
@@ -1164,21 +1291,26 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5c68000000000000ull, 0xfff8000000000000ull) || OPM(0x4c68000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3868000000000000ull, 0xfef8000000000000ull)) {  // FMUL
         static const char *const scale[] = {"", " * 0.5f", " * 0.25f", " * 0.125f", " * 8.0f", " * 4.0f", " * 2.0f", ""};
-        sprintf(t, "(%s * %s%s)", F(R(a)), NA(F(B(true)), bits(w, 48, 1), false), scale[bits(w, 41, 3)]);
+        // (.FMZ: bits 44-45 == 2)
+        if (bits(w, 44, 2) == 2) sprintf(t, "(fmz(%s, %s)%s)", F(R(a)), NA(F(B(true)), bits(w, 48, 1), false), scale[bits(w, 41, 3)]);
+        else sprintf(t, "(%s * %s%s)", F(R(a)), NA(F(B(true)), bits(w, 48, 1), false), scale[bits(w, 41, 3)]);
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
     } else if (OPM(0x1e00000000000000ull, 0xff00000000000000ull)) {  // FMUL32I
-        sprintf(t, "(%s * as_type<float>(0x%08xu))", F(R(a)), (uint32_t)bits(w, 20, 32));
+        sprintf(t, bits(w, 53, 2) == 2 ? "fmz(%s, as_type<float>(0x%08xu))" : "(%s * as_type<float>(0x%08xu))", F(R(a)),
+                (uint32_t)bits(w, 20, 32));
         set_reg(c, d, FRES(t, bits(w, 55, 1)));
     } else if (OPM(0x5980000000000000ull, 0xff80000000000000ull) || OPM(0x4980000000000000ull, 0xff80000000000000ull) ||
                OPM(0x5180000000000000ull, 0xff80000000000000ull) || OPM(0x3280000000000000ull, 0xfe80000000000000ull)) {  // FFMA
         const char *bv;
         char cbuf_c[256], bbuf[256];
         const char *cv = operand_c_for_ffma(c, w, cbuf_c, &bv, bbuf);
-        sprintf(t, "fma(%s, %s, %s)", F(R(a)), NA(F(bv), bits(w, 48, 1), false), NA(F(cv), bits(w, 49, 1), false));
+        sprintf(t, "%s(%s, %s, %s)", bits(w, 53, 2) == 2 ? "ffmz" : "fma", F(R(a)), NA(F(bv), bits(w, 48, 1), false),
+                NA(F(cv), bits(w, 49, 1), false));
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
     } else if (OPM(0x0c00000000000000ull, 0xfc00000000000000ull)) {  // FFMA32I
         sprintf(u, "as_type<float>(0x%08xu)", (uint32_t)bits(w, 20, 32));
-        sprintf(t, "fma(%s, %s, %s)", NA(F(R(a)), bits(w, 56, 1), false), u, NA(F(R(d)), bits(w, 57, 1), false));
+        sprintf(t, "%s(%s, %s, %s)", bits(w, 53, 2) == 2 ? "ffmz" : "fma", NA(F(R(a)), bits(w, 56, 1), false), u,
+                NA(F(R(d)), bits(w, 57, 1), false));
         set_reg(c, d, FRES(t, bits(w, 55, 1)));
     } else if (OPM(0x5c60000000000000ull, 0xfff8000000000000ull) || OPM(0x4c60000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3860000000000000ull, 0xfef8000000000000ull)) {  // FMNMX
@@ -1586,6 +1718,32 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else sprintf(t, "uint((v << s) >> 32)");
         if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = %s;\n", d, t); }
         sp(&c->body, "    }\n");
+    } else if (OPM(0xebf8000000000000ull, 0xfff8000000000000ull)) {  // RED: an atomic reduction on global memory (no
+        // result; yuzu's atomic_operations_global_memory.cpp): value B (bits 0-7), address A (+ A+1 when .E) + offset
+        int size = (int)bits(w, 20, 3), op = (int)bits(w, 23, 3);  // size: 0 u32, 1 s32, 3 f32; op: add min max inc dec and or xor
+        int64_t off = sbits(w, 28, 20);
+        bool wide = bits(w, 48, 1);
+        int vb = (int)bits(w, 0, 8);
+        if (c->glsl) { fail(c, "red: glsl"); }
+        else if (!(size == 0 || size == 1 || (size == 3 && op == 0)) || op == 3 || op == 4) { fail(c, "red size %d op %d", size, op); }
+        else {
+            c->info->uses_gmem = true;
+            c->uses_gmem_store = true;
+            c->info->uses_gmem_store = true;
+            char addr[256];
+            if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+            else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+            else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+            static const char *const fn[] = {"add", "min", "max", "", "", "and", "or", "xor"};
+            const char *ty = size == 3 ? "atomic_float" : size == 1 ? "atomic_int" : "atomic_uint";
+            char v[64];
+            if (size == 3) sprintf(v, "as_type<float>(%s)", R(vb));
+            else if (size == 1) sprintf(v, "int(%s)", R(vb));
+            else sprintf(v, "%s", R(vb));
+            sp(&c->body, "    { ulong ga = %s - 0x%llxul;\n", addr, (unsigned long long)maxwell_gmem_base);
+            sp(&c->body, "      if (ga < 0x%llxul) atomic_fetch_%s_explicit((device %s *)(gmem + ga), %s, memory_order_relaxed); }\n",
+               (unsigned long long)maxwell_gmem_size, fn[op], ty, v);
+        }
     } else if (OPM(0xeed0000000000000ull, 0xfff8000000000000ull) || OPM(0xeed8000000000000ull, 0xfff8000000000000ull)) {  // LDG / STG
         bool store = bits(w, 51, 1);
         bool wide = bits(w, 45, 1);
@@ -1709,6 +1867,44 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
         sp(&c->body, "    }\n");
     } else if (emit_half(c, w)) {
+    } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE: all / any / eq of a predicate over the warp
+        int pa = (int)bits(w, 39, 3), pb = (int)bits(w, 45, 3), op = (int)bits(w, 48, 2);
+        const char *v = P(pa, bits(w, 42, 1));
+        if (c->glsl) { fail(c, "vote: glsl"); }
+        else {
+            sp(&c->body, "    { bool vp = %s;\n", v);
+            if (pb != PT) {
+                c->pred_used[pb] = 1;
+                sp(&c->body, op == 0 ? "      p%d = simd_all(vp);\n" : op == 1 ? "      p%d = simd_any(vp);\n"
+                                                                     : "      p%d = simd_all(vp) || simd_all(!vp);\n", pb);
+            }
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(ulong(simd_ballot(vp)));\n", d); }
+            sp(&c->body, "    }\n");
+        }
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {  // VMNMX (word operands; yuzu's
+        // video_minimum_maximum.cpp): min / max of A and B (signed when B is), then merged into C by the second op
+        bool breg = bits(w, 50, 1), bs = bits(w, 49, 1), ds = bits(w, 54, 1), mx = bits(w, 56, 1);
+        int op = (int)bits(w, 51, 3);
+        char bv[48];
+        if (breg) sprintf(bv, "%s", R((int)bits(w, 20, 8)));
+        else sprintf(bv, "%uu", (uint32_t)bits(w, 20, 16));
+        const char *av = R(a), *cv = R((int)bits(w, 39, 8));
+        char lhs[256], t2[512];
+        if (bs) sprintf(lhs, "uint(%s(int(%s), int(%s)))", mx ? "max" : "min", av, bv);
+        else sprintf(lhs, "%s(%s, %s)", mx ? "max" : "min", av, bv);
+        switch (op) {
+        case 0: sprintf(t2, "((%s) & 0x0000FFFFu) | (((%s) & 0xFFFFu) << 16)", cv, lhs); break;  // MRG_16H
+        case 1: sprintf(t2, "((%s) & 0xFFFF0000u) | ((%s) & 0xFFFFu)", cv, lhs); break;          // MRG_16L
+        case 2: sprintf(t2, "((%s) & 0xFFFFFF00u) | ((%s) & 0xFFu)", cv, lhs); break;            // MRG_8B0
+        case 3: sprintf(t2, "((%s) & 0xFF00FFFFu) | (((%s) & 0xFFu) << 16)", cv, lhs); break;    // MRG_8B2
+        case 4: sprintf(t2, "(%s) + (%s)", lhs, cv); break;                                        // ACC
+        case 5: case 6:                                                                          // MIN / MAX
+            if (ds) sprintf(t2, "uint(%s(int(%s), int(%s)))", op == 6 ? "max" : "min", lhs, cv);
+            else sprintf(t2, "%s(%s, %s)", op == 6 ? "max" : "min", lhs, cv);
+            break;
+        default: fail(c, "vmnmx op %d", op); t2[0] = 0;
+        }
+        if (t2[0]) set_reg(c, d, t2);
     } else if (OPM(0x50f8000000000000ull, 0xfff8000000000000ull)) {  // FSWZADD
         // per quad lane (laneid & 3), 2 bits of the swizzle pick: a+b, b-a, a-b, b
         uint32_t swz = (uint32_t)bits(w, 28, 8);
@@ -1787,14 +1983,23 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (pd != PT) { c->pred_used[pd] = 1; sp(&c->body, "    p%d = true;\n", pd); }
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
-        if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
         int shift = (int)bits(w, 41, 2) * 8;
         const char *mask = B(false);
+        if (bits(w, 40, 1)) {  // .CC: the flags Z, S, C from bits 0-2 (as P2R.CC writes them; overflow isn't tracked)
+            c->uses_cc = true;
+            sp(&c->body, "    { uint m = %s, v = %s >> %du;\n", mask, R(a), shift);
+            sp(&c->body, c->glsl ? "      if ((m & 1u) != 0u) ccz = (v & 1u) != 0u;\n      if ((m & 2u) != 0u) ccs = (v & 2u) != 0u;\n"
+                                   "      if ((m & 4u) != 0u) cc = (cc & ~1u) | ((v >> 2) & 1u);\n    }\n"
+                                 : "      if (m & 1u) ccz = (v & 1u) != 0u;\n      if (m & 2u) ccs = (v & 2u) != 0u;\n"
+                                   "      if (m & 4u) cc = (cc & ~1u) | ((v >> 2) & 1u);\n    }\n");
+            goto r2p_done;
+        }
         for (int i = 0; i < 7; i++) {
             c->pred_used[i] = 1;
             sp(&c->body, c->glsl ? "    if (((%s >> %du) & 1u) != 0u) p%d = ((%s >> %du) & 1u) != 0u;\n"
                                  : "    if ((%s >> %du) & 1u) p%d = ((%s >> %du) & 1u) != 0u;\n", mask, i, i, R(a), shift + i);
         }
+    r2p_done:;
     } else if (OPM(0x38e8000000000000ull, 0xfef8000000000000ull) || OPM(0x5ce8000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4ce8000000000000ull, 0xfff8000000000000ull)) {  // P2R
         int shift = (int)bits(w, 41, 2) * 8;
@@ -2412,12 +2617,17 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     sp(&s, "static inline uint bfi(uint ins, uint ctl, uint base) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u || pos >= 32u) return base; return insert_bits(base, ins, pos, min(len, 32u - pos)); }\n");
     sp(&s, "static inline float fswzadd(float a, float b, uint swz, uint lane) { uint m = (swz >> ((lane & 3u) * 2u)) & 3u; float ma = m == 1u ? -1.0f : (m == 3u ? 0.0f : 1.0f); float mb = m == 2u ? -1.0f : 1.0f; return a * ma + b * mb; }\n");
     sp(&s, "static inline uint2 rsc(uint2 c, float4 s) { return (s.x == 1.0f && s.y == 1.0f) ? c : uint2(floor((float2(c) + 0.5f) * s.xy)); }\n");
-    sp(&s, "static inline float2 uvs(float2 uv, float4 s) { return (s.z == 1.0f && s.w == 1.0f) ? uv : min(uv, 1.0f) * s.zw; }\n");
+    sp(&s, "static inline float2 uvs(float2 uv, float4 s) { uv = select(uv, float2(0.0f), isnan(uv)); return (s.z == 1.0f && s.w == 1.0f) ? uv : min(uv, 1.0f) * s.zw; }\n");
     sp(&s, "static inline float2 hx(uint v, uint swz) { if (swz == 1u) return float2(as_type<float>(v)); float2 h = float2(as_type<half2>(v)); return swz == 2u ? h.xx : swz == 3u ? h.yy : h; }\n");
     // merges on half2 lanes rather than with integer masks: on an M1 (macOS 15.0.1) the Metal compiler miscompiled
     // (old & 0xFFFF0000u) | lo in Link's body shader - the merged low half read back as a constant 512.0 and Link
     // rendered white. Same bits either way.
     sp(&s, "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); half2 o = as_type<half2>(old), n = half2(r); if (merge == 2u) o.x = n.x; else if (merge == 3u) o.y = n.y; else o = n; return as_type<uint>(o); }\n");
+    // FMUL / FFMA .FMZ (D3D9-style): a zero factor gives zero whatever the other one is (inf, NaN)
+    sp(&s, "static inline float fmz(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n");
+    sp(&s, "static inline float ffmz(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c + 0.0f : fma(a, b, c); }\n");
+    // (the GPU's texture units read a NaN coordinate as 0; Metal's samplers give the far edge)
+    sp(&s, "static inline float3 nn3(float3 v) { return select(v, float3(0.0f), isnan(v)); }\n");
     sp(&s, "static inline uint prmt(uint a, uint b, uint sel) { uint r = 0; for (uint i = 0; i < 4; i++) { uint s = (sel >> (i * 4)) & 7u; uint byte = s < 4 ? (a >> (s * 8)) & 0xFFu : (b >> ((s - 4) * 8)) & 0xFFu; r |= byte << (i * 8); } return r; }\n");
 
     // inputs/outputs
@@ -2497,8 +2707,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         for (int i = 0; i < 32; i++)
             if (c->out_attr_mask & (1u << i)) sp(&s, "  out.v%d = float4(0, 0, 0, 1);\n", i);
     } else if (stage == STAGE_FRAGMENT) {
-        sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s) {\n",
-           c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
+        sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s%s) {\n",
+           c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "",
+           c->uses_point_coord ? ", float2 point_coord [[point_coord]]" : "", args.buf ? args.buf : "");
     } else {
         sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s) {\n",
            args.buf ? args.buf : "");
@@ -2526,7 +2737,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (key && key->flip_y) sp(&s, "  out.pos.y = -out.pos.y;\n");
         if (key && key->flip_x) sp(&s, "  out.pos.x = -out.pos.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  out.pos.z = (out.pos.z + out.pos.w) * 0.5f;\n");
-        if (maxwell_dbg_vs && blob == maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
+        // (LARECOMP_DBG_VS_EXPR=<MSL float4 expression>: captured instead of out.v1, e.g. a constant buffer row)
+        if (maxwell_dbg_vs && blob == maxwell_dbg_vs)
+            sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n"
+                   "  if (iid == 0u && vid < 4096u) dbgout[1024u + vid] = out.pos;\n",
+               getenv("LARECOMP_DBG_VS_EXPR") ? getenv("LARECOMP_DBG_VS_EXPR") : (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
         sp(&s, "  return out;\n}\n");
     } else if (stage == STAGE_FRAGMENT) {
         sp(&s, "  FOut o;\n");
@@ -2552,6 +2767,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             sp(&s, "  if (ltint[0].w > 0.0f) { float3 g = o.c0.rgb; float l = dot(g, float3(0.299f, 0.587f, 0.114f));\n"
                    "    o.c0.rgb = mix(g, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n");
         if (tint) emit_recolour(&s, "o.c0", "float3", "float4");
+        // (debugging: where geometry lands) LARECOMP_FS_RED=1: every fragment shader, =<hex code address>: that one
+        const char *red = getenv("LARECOMP_FS_RED");
+        if (red && (!strcmp(red, "1") || strtoull(red, NULL, 16) == (uint64_t)(uintptr_t)blob))
+            sp(&s, "  o.c0 = float4(1, 0, 0, 1);\n");
         if (c->omap_depth) {
             if (c->reg_used[r + 1]) sp(&s, "  o.depth = as_type<float>(r%d);\n", r + 1);
             else sp(&s, "  o.depth = in.pos.z;\n");

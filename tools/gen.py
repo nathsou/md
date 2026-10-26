@@ -22,6 +22,8 @@ from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_RELATIVE
 
 SCRATCH_MEM = 0x7300000000
+# How far back from a `br` its jump table's bounds check and address arithmetic are looked for (instructions)
+JT_WINDOW = 48
 
 
 def sext26(w):
@@ -177,7 +179,7 @@ class Module:
 
         def step_to(frm, to):
             pc = frm
-            for _ in range(64):
+            for _ in range(JT_WINDOW + 16):
                 if pc == to:
                     return True
                 mu.emu_start(pc, 0, count=1)
@@ -235,10 +237,11 @@ class Module:
 
     def _jump_table_fallthrough(self, br_pc, entry, end):
         rn = bits(self.word(br_pc), 5, 5)
-        # find the guarding b.hi / b.hs and its cmp, scanning backwards
+        # find the guarding b.hi / b.hs and its cmp, scanning backwards (through straight-line code: compilers
+        # schedule register setup for every case between the table lookup and the br, 29 instructions in ACNH 2.0.7)
         a = br_pc - 4
         guard = cmp = None
-        while a >= entry and br_pc - a <= 4 * 16:
+        while a >= entry and br_pc - a <= 4 * JT_WINDOW:
             w = self.word(a)
             if (w & 0xFF000010) == 0x54000000 and bits(w, 0, 4) in (8, 2):
                 guard = a
@@ -279,7 +282,7 @@ class Module:
         def step_to(frm, to):
             # single-step: Unicorn's `until` is unreliable mid translation-block
             pc = frm
-            for _ in range(64):
+            for _ in range(JT_WINDOW + 16):
                 if pc == to:
                     return True
                 mu.emu_start(pc, 0, count=1)
@@ -319,7 +322,7 @@ class Module:
         """True if the br register comes from address arithmetic (a table) rather than a load."""
         rn = bits(self.word(br_pc), 5, 5)
         a = br_pc - 4
-        while a >= entry and br_pc - a <= 4 * 16:
+        while a >= entry and br_pc - a <= 4 * JT_WINDOW:
             w = self.word(a)
             if self.lift(a).kind not in ('op', 'asm'):
                 return False
@@ -527,8 +530,9 @@ class Module:
         return out
 
 
-# tools/patches.py, for the main module only (its sites are main addresses): loaded in main() once the game version
-# is known from the NSO's build ID (tools/game_addresses.py; an unknown build ID stops the generator)
+# The game profile's patches.py (games/<id>/, tools/games.py), loaded in main() once the game and version are known
+# from the main program's build ID (none for a game without a profile). Sites are absolute guest addresses: each
+# module picks up those in its own text.
 HOOKS, PATCHES = {}, {}
 RANDO_CODE = {}  # (LASRecomp's randomizer patch variants: none for Dread)
 
@@ -552,6 +556,7 @@ def main():
     ap.add_argument('base', type=lambda s: int(s, 0))
     ap.add_argument('outdir')
     ap.add_argument('--hle')
+    ap.add_argument('--main', help="the game's main NSO (its build ID picks the game profile; default: this NSO)")
     ap.add_argument('--chunk', type=int, default=1500)  # functions per file at most
     ap.add_argument('--chunk-bytes', type=int, default=1500000)  # and about this much C (even compile times)
     ap.add_argument('--big-fn', type=int, default=100000)  # bytes of C from which a function gets its own file
@@ -562,17 +567,19 @@ def main():
 
     t0 = time.time()
     m = Module(args.name, args.nso, args.base, args.simd)
-    if args.name == 'main':
-        global HOOKS, PATCHES
-        import game_addresses
-        try:
-            version = game_addresses.select_build_id(m.nso.build_id)
-        except game_addresses.UnknownGameVersion as e:
-            sys.exit(f'{args.name}: {e}')
-        import patches
-        HOOKS, PATCHES = patches.HOOKS, patches.PATCHES
-        label, build_id = game_addresses.VERSIONS[version]
-        print(f'{args.name}: game version {label} (build {build_id[:16]}), address table {version}', file=sys.stderr)
+    global HOOKS, PATCHES
+    import games
+    main_nso = m.nso if args.main is None else Nso(args.main)
+    profile = games.select_build_id(main_nso.build_id)
+    if profile:
+        HOOKS, PATCHES = games.patches(profile)
+        key = games.SELECTED[1]
+        label, build_id = profile.versions[key]
+        print(f'{args.name}: {profile.name} {label} (build {build_id[:16]}), {len(HOOKS)} hooks, {len(PATCHES)} patches',
+              file=sys.stderr)
+    else:
+        print(f'{args.name}: no game profile for main build {main_nso.build_id[:16].upper()}: no patches or hooks',
+              file=sys.stderr)
     starts = m.boundaries()
     hle = {}
     if args.hle and os.path.exists(args.hle):
@@ -699,8 +706,6 @@ def main():
         f.write('};\n')
         f.write(f'const uint64_t {args.name}_fn_count = {len(order)};\n')
         write_if_changed(os.path.join(args.outdir, f'{args.name}_table.c'), f.getvalue())
-    if args.name == 'main':  # (what this code was generated from: the Makefile's game code library id, GAMELIB_BUILD_ID)
-        write_if_changed(os.path.join(args.outdir, 'main_build_id.txt'), game_addresses.VERSIONS[version][1] + '\n')
     print(f'{args.name}: wrote {nchunks} chunks, {time.time() - t0:.0f}s total', file=sys.stderr)
 
 

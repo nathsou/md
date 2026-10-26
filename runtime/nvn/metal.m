@@ -13,9 +13,9 @@
 #include <SDL3/SDL_metal.h>
 #include <stdatomic.h>
 
+#include "game.h"
 #include "nvn.h"
 #include "rqueue.h"
-#include "../game_addresses.h"
 #include "renderer.h"
 #include "pace.h"
 #include "texpatch.h"
@@ -274,7 +274,7 @@ static void level_change_check(void) {
 // rando/DevGen3 Tail Cave 07D: clean dark pit, no trails; overworld / dungeon rooms otherwise unchanged.
 bool renderer_texture_frame_fresh(NvnTexture *t) {
     static int on = -1;
-    if (on < 0) on = getenv("LARECOMP_NO_FRAME_CLEAR") == NULL;
+    if (on < 0) on = getenv("LARECOMP_NO_FRAME_CLEAR") == NULL && game_flag(GAME_CLEAR_SCREEN_TARGETS);
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (!on || !b || !b->scalable || b->frame_cleared == renderer_exec_frame() + 1) return false;
     b->frame_cleared = renderer_exec_frame() + 1;
@@ -284,7 +284,7 @@ bool renderer_texture_frame_fresh(NvnTexture *t) {
 bool renderer_texture_level_fresh(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     static int keep = -1;
-    if (keep < 0) keep = getenv("LARECOMP_KEEP_TARGETS") != NULL;
+    if (keep < 0) keep = getenv("LARECOMP_KEEP_TARGETS") != NULL || !game_flag(GAME_CLEAR_SCREEN_TARGETS);
     if (!b || keep || b->level_gen == g_level_gen) return false;
     if (!b->scalable) { b->level_gen = g_level_gen; return false; }  // scene buffers only: UI textures the game draws once
                                                                        // and reuses (rupee counter) must keep their contents
@@ -830,13 +830,14 @@ void backend_init(void) {
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
     present_sampler = [dev newSamplerStateWithDescriptor:sd];
-    // Wrap the guest heap: memory pools live there, and GPU addresses are guest addresses.
+    // Wrap the guest heap and the virtual pools' range after it: memory pools live there, and GPU addresses are guest
+    // addresses.
     g_guest_buffer_base = HEAP_BASE;
-    g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:HEAP_MAX
+    g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:GPU_SPAN
                                            options:MTLResourceStorageModeShared deallocator:nil];
     if (!g_guest_buffer) FATAL("cannot wrap guest heap in a Metal buffer (max %llu)\n", (uint64_t)dev.maxBufferLength);
     renderer_init(dev);
-    LOG("[metal] %s, heap buffer %llu MB\n", dev.name.UTF8String, (uint64_t)HEAP_MAX >> 20);
+    LOG("[metal] %s, heap buffer %llu MB\n", dev.name.UTF8String, (uint64_t)GPU_SPAN >> 20);
 }
 
 id<MTLCommandQueue> renderer_queue(void) { return queue; }
@@ -862,7 +863,7 @@ void backend_reset(void) {
 
 void backend_guest_memory_reset(void) {
     if (!queue) return;
-    g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:HEAP_MAX
+    g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:GPU_SPAN
                                            options:MTLResourceStorageModeShared deallocator:nil];
     if (!g_guest_buffer) FATAL("cannot wrap guest heap in a Metal buffer\n");
 }
@@ -1148,7 +1149,65 @@ void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path) {
 static float g_shot_crop[4] = {0, 0, 1, 1};  // presented crop of the current frame (screenshots match it)
 static float g_shot_frac[2] = {1, 1};        // the part of the game image its contents occupy (Dynamic: shots take that part)
 static bool g_save_upright;  // (set around saves of the window image: test shots under any name)
+// LARECOMP_DEBUG_NAN (debug frames): an RGBA16Float image's non-finite / negative texel counts and largest value
+static void float_stats(id<MTLTexture> tex, const char *path) {
+    bool packed = tex.pixelFormat == MTLPixelFormatRG11B10Float;
+    if ((tex.pixelFormat != MTLPixelFormatRGBA16Float && !packed) || tex.textureType != MTLTextureType2D ||
+        !getenv("LARECOMP_DEBUG_NAN"))
+        return;
+    NSUInteger w = tex.width, h = tex.height, row = w * (packed ? 4 : 8);
+    id<MTLBuffer> buf = [dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+              toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [b endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const __fp16 *px = buf.contents;
+    size_t nan = 0, inf = 0, neg = 0, first = SIZE_MAX;
+    float mx = 0;
+    const uint32_t *pk = buf.contents;
+    for (size_t i = 0; i < w * h * (packed ? 3 : 4); i++) {
+        float v;
+        if (packed) {  // (R11 G11 B10 unsigned floats: exponent 31 is inf / NaN)
+            uint32_t x = pk[i / 3], c = i % 3, bits = c == 2 ? 10 : 11, f = (x >> (c * 11)) & ((1u << bits) - 1);
+            uint32_t e = f >> (bits - 5), m = f & ((1u << (bits - 5)) - 1);
+            v = e == 31 ? (m ? NAN : INFINITY) : ldexpf(e ? 1.0f + m / (float)(1u << (bits - 5)) : m / (float)(1u << (bits - 5)), e ? (int)e - 15 : -14);
+        } else v = px[i];
+        if (v != v) { nan++; if (first == SIZE_MAX) first = i / (packed ? 3 : 4); }
+        else if (isinf(v)) inf++;
+        else { if (v < 0) neg++; if (v > mx) mx = v; }
+    }
+    LOG("[nan] %s: %zu NaN, %zu inf, %zu negative, max %g (first NaN at %zu,%zu)\n", path, nan, inf, neg, mx,
+        first == SIZE_MAX ? 0 : first % w, first == SIZE_MAX ? 0 : first / w);
+    if (!packed) {  // (a 5x4 grid of texels: alpha)
+        LOG("[nan]   alpha grid:");
+        for (int gy = 0; gy < 4; gy++) {
+            for (int gx = 0; gx < 5; gx++) {
+                size_t x = w * (2 * gx + 1) / 10, y = h * (2 * gy + 1) / 8;
+                LOG(" %.3g", (float)px[(y * w + x) * 4 + 3]);
+            }
+            LOG(" |");
+        }
+        LOG("\n");
+    }
+    if (packed) {  // (a 5x4 grid of texels: red channel)
+        LOG("[nan]   grid:");
+        for (int gy = 0; gy < 4; gy++) {
+            for (int gx = 0; gx < 5; gx++) {
+                size_t x = w * (2 * gx + 1) / 10, y = h * (2 * gy + 1) / 8;
+                uint32_t q = pk[y * w + x], f = q & 0x7ff, e = f >> 6, m = f & 63;
+                LOG(" %.4g", e == 31 ? NAN : ldexpf(e ? 1.0f + m / 64.0f : m / 64.0f, e ? (int)e - 15 : -14));
+            }
+            LOG(" |");
+        }
+        LOG("\n");
+    }
+}
+
 void renderer_save_texture(id<MTLTexture> tex, const char *path) {
+    float_stats(tex, path);
     NSUInteger w = tex.width, h = tex.height;
     float shot_crop[4] = {0, 0, 1, 1};
     if (strstr(path, "frame_")) {
@@ -1241,6 +1300,9 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     renderer_submit();  // same queue: the present pass runs after the frame's work
     TexBackend *b = t->backend;
     if (b) b->presented = true;
+    if (getenv("LARECOMP_LOG_PRESENT") && frame % 120 == 0)  // (debugging: what is shown)
+        LOG("[present] frame %llu tex %p %ux%u f%#x addr %#llx backend %p metal %p %s\n", (unsigned long long)frame, (void *)t,
+            t->width, t->height, t->format, (unsigned long long)t->addr, (void *)b, b ? (__bridge void *)b->tex : NULL, t->label);
     @autoreleasepool {
         uint64_t nd0 = SDL_GetTicksNS();
         rq_watch("nextDrawable", frame);
@@ -1569,7 +1631,8 @@ void ui_window_init(void) {
     // LARECOMP_HIDDEN=1: never shown (automated test runs render off screen without taking the user's focus)
     SDL_WindowFlags wflags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
-    window = SDL_CreateWindow("Dread Recomp", win_w, win_h, wflags);
+    extern const char *rt_window_title(void);  // (main.c: "nx - <game>")
+    window = SDL_CreateWindow(rt_window_title(), win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
