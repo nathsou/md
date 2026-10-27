@@ -402,6 +402,14 @@ Engine fixes it needed, all shared:
   images (and scaled up again to the window). Textures given to an NVN window now carry a host-only flag
   (NVN_TEX_HOST_WINDOW) and are scaled too: `resolution = 2x` gives a real 3840x2160 image (30 fps on an M4 Pro,
   frame generation and camera photos included).
+- Render thread: every draw copied its bound uniform buffers into the ring (indexed ones whole, up to 64 KB). ACNH
+  records each draw as its own small command list and binds the same 40 KB buffer to all of them: 55 MB copied a
+  frame, a new 64 MB ring every ~15 ms, a quarter of the render thread. renderer.m's snap_reuse shares a snapshot
+  until a command writes its range (uniform updates, counter reports, buffer clears and copies) or may write anywhere
+  (dispatches, fences, a new list). ACNH uncapped on an M4 Pro: 77 -> 115 fps at 1440p, 98 fps at 4K
+  (LARECOMP_SNAP_VERIFY=1 compares each shared snapshot with memory: one 256-byte buffer the game rewrites for its
+  next frame while this one is translated differs, as it raced before). ACNH draws no motion vectors (one color
+  target and depth for its scene), which MetalFX's frame interpolator and temporal scaler would need.
 - Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
   that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
   back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one
