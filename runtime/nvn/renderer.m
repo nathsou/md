@@ -31,6 +31,7 @@ static uint64_t stat_clears_as_load, stat_clear_passes;  // (deferred clears)
 #define SKIPPED() (stat_skipped++, g_debug_frame ? (void)LOG("[draw] skipped (renderer.m:%d)\n", __LINE__) : (void)0)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_vcopy, stat_vcopy_bytes;  // vertex / index ranges copied at translation (dyn_copy)
+static uint64_t stat_ring_bytes, stat_ring_new, stat_ring_reused;  // uniform data copied to the ring; rings made; bytes not copied again
 static double stat_gpu_s;
 // GPU busy time (dynamic resolution: output_scale.c; the "gpu" of the [metal] stats line), ns so far: the game's
 // command buffers, the window image's (metal.m backend_present), and the plain sum of their spans (diagnostics)
@@ -126,9 +127,9 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB ring %.0f MB (%llu new, %.0f MB reused) mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
-             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
+             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, stat_ring_bytes / 1048576.0, (unsigned long long)stat_ring_new, stat_ring_reused / 1048576.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
              (unsigned long long)stat_counters_gpu, pace_is_slow() ? "30" : "60", (unsigned long long)pace_frames_over());
     stat_counters_gpu = 0;
     stat_compiles = 0;
@@ -136,6 +137,7 @@ const char *renderer_stats(void) {
     stat_compile_ms = 0;
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     stat_vcopy = stat_vcopy_bytes = 0;
+    stat_ring_bytes = stat_ring_new = stat_ring_reused = 0;
     memset(stat_wait_by, 0, sizeof stat_wait_by); memset(stat_wait_n, 0, sizeof stat_wait_n);
     stat_gpu_s = 0;
     stat_clears_as_load = stat_clear_passes = 0;
@@ -1169,6 +1171,23 @@ static id<MTLBuffer> ring;
 static uint64_t ring_off;
 #define RING_SIZE (64u << 20)
 
+// Uniform snapshots a later draw can share (snap_reuse): their ring offset stays valid, and their source unchanged,
+// until snap_epoch moves - a new ring or a reset of this one, a command that may write guest memory anywhere, a new
+// list - or a command writes their range (snap_wrote: uniform updates and counter reports, thousands a frame).
+static uint32_t snap_epoch = 1;
+static struct { uint64_t lo, hi; } snap_wlog[64];  // (ranges written since the epoch began, in order)
+static uint32_t snap_nw;
+static void snap_invalidate(void) { snap_epoch++; snap_nw = 0; }
+static void snap_wrote(uint64_t addr, uint64_t size) {
+    if (snap_nw && addr <= snap_wlog[snap_nw - 1].hi && addr + size >= snap_wlog[snap_nw - 1].lo) {  // (next to the last: one)
+        if (addr < snap_wlog[snap_nw - 1].lo) snap_wlog[snap_nw - 1].lo = addr;
+        if (addr + size > snap_wlog[snap_nw - 1].hi) snap_wlog[snap_nw - 1].hi = addr + size;
+        return;
+    }
+    if (snap_nw == 64) { snap_invalidate(); return; }
+    snap_wlog[snap_nw].lo = addr, snap_wlog[snap_nw].hi = addr + size, snap_nw++;
+}
+
 static uint64_t ring_alloc(const void *data, uint64_t size) {
     if (!ring) ring = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared];
     uint64_t aligned = (ring_off + 255) & ~255ull;
@@ -1176,13 +1195,50 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
         // Start a fresh ring; command buffers in flight keep the old one alive until they complete.
         ring = [dev newBufferWithLength:(size > RING_SIZE ? size : RING_SIZE) options:MTLResourceStorageModeShared];
         aligned = 0;
+        snap_invalidate();
+        stat_ring_new++;
     }
     memcpy((uint8_t *)ring.contents + aligned, data, size);
     ring_off = aligned + size;
+    stat_ring_bytes += size;
     return aligned;
 }
 
-static void ring_reset(void) { ring_off = 0; }
+static void ring_reset(void) { ring_off = 0; snap_invalidate(); }
+
+// ring_alloc of guest memory, shared with an earlier draw's snapshot of the same range when nothing can have
+// written it since (the engine binds the same per-frame and per-view buffers - up to 64 KB, indexed ones whole -
+// to draw after draw: copying them again was a quarter of the render thread's time in Animal Crossing). CPU stores
+// from other threads while a list is translated race on the Switch too: the GPU reads them whenever it gets there.
+static uint64_t snap_reuse(uint64_t addr, uint64_t size) {
+    static struct { uint64_t addr, size, off; uint32_t epoch, nw; } tab[1024];
+    __typeof__(&tab[0]) e = &tab[((addr >> 4) ^ (addr >> 14) ^ size) & 1023];
+    if (e->epoch == snap_epoch && e->addr == addr && e->size == size) {
+        uint32_t i = e->nw;
+        while (i < snap_nw && (addr >= snap_wlog[i].hi || addr + size <= snap_wlog[i].lo)) i++;
+        if (i == snap_nw) {
+            // LARECOMP_SNAP_VERIFY=1: check each shared snapshot against the memory it stands for. (Animal Crossing:
+            // one 256-byte buffer differs now and then - the game's CPU rewriting it for its next frame while this one
+            // is translated; each draw copying it raced the same way)
+            static int verify = -1;
+            if (verify < 0) verify = getenv("LARECOMP_SNAP_VERIFY") != NULL;
+            if (verify) {
+                static uint64_t n, bad;
+                n++;
+                if (memcmp((uint8_t *)ring.contents + e->off, (void *)(uintptr_t)addr, size) && bad++ < 20)
+                    LOG("[snap] shared uniform snapshot %llx+%llu differs from memory (%llu of %llu)\n", (unsigned long long)addr,
+                        (unsigned long long)size, (unsigned long long)bad, (unsigned long long)n);
+                if (!(n & 0xFFFFF)) LOG("[snap] %llu shared uniform snapshots checked, %llu differed\n", (unsigned long long)n, (unsigned long long)bad);
+            }
+            e->nw = snap_nw;
+            stat_ring_reused += size;
+            return e->off;
+        }
+    }
+    uint64_t off = ring_alloc((void *)(uintptr_t)addr, size);
+    e->addr = addr, e->size = size, e->off = off, e->epoch = snap_epoch, e->nw = snap_nw;  // (after: a new ring moved the epoch)
+    return off;
+}
 
 // (debug) LARECOMP_LOG_BINDS=1: guest memory the GPU reads in place, per frame (bytes bound; distinct ranges once),
 // and the ranges of the previous frame whose contents the game rewrote by the time this frame is translated: with
@@ -2641,7 +2697,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;  // indexed: whole buffer
         if (size > r.size && r.size) size = r.size;
         if (size < 16) size = 16;
-        uint64_t off = ring_alloc((void *)(uintptr_t)r.addr, size);  // snapshot, as later CPU writes must not leak in
+        uint64_t off = snap_reuse(r.addr, size);  // snapshot, as later CPU writes must not leak in
         if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
         else [enc setFragmentBuffer:ring offset:off atIndex:k];
     }
@@ -4236,6 +4292,19 @@ static void exec_list(uint64_t handle, int depth) {
         prev = p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        // (state, draws, clears and copies of textures, barriers don't write guest memory; the commands below that
+        // write a known range note it; anything else may write anywhere: snapshots are all taken again after it)
+        switch (r->op) {
+        case CMD_BIND_PROGRAM ... CMD_CLEAR_TEXTURE: case CMD_DRAW_ARRAYS ... CMD_DRAW_ELEMENTS_INDIRECT: case CMD_END: case CMD_JUMP: case CMD_CALL:
+        case CMD_BARRIER: case CMD_DISCARD_COLOR: case CMD_DISCARD_DEPTH_STENCIL: case CMD_COPY_BUFFER_TO_TEXTURE:
+        case CMD_COPY_TEXTURE_TO_TEXTURE: case CMD_DOWNSAMPLE: case CMD_DRAW_TEXTURE: case CMD_RESOLVE_DEPTH: break;
+        case CMD_UPDATE_UNIFORM_BUFFER: snap_wrote(r->x[0] + r->x[2], r->x[3]); break;
+        case CMD_REPORT_VALUE: snap_wrote(r->x[1], 4); break;
+        case CMD_REPORT_COUNTER: snap_wrote(r->x[1], 16); break;
+        case CMD_CLEAR_BUFFER: snap_wrote(r->x[0], r->x[1]); break;
+        case CMD_COPY_BUFFER_TO_BUFFER: snap_wrote(r->x[1], r->x[2]); break;
+        default: snap_invalidate();
+        }
         if (st.render_off && (r->op == CMD_CLEAR_COLOR || r->op == CMD_CLEAR_DEPTH_STENCIL || r->op == CMD_CLEAR_TEXTURE ||
                               r->op == CMD_DRAW_ARRAYS || r->op == CMD_DRAW_ELEMENTS || r->op == CMD_DRAW_ARRAYS_INDIRECT ||
                               r->op == CMD_DRAW_ELEMENTS_INDIRECT)) {
@@ -4721,6 +4790,7 @@ void renderer_reset(void) {
 
 void backend_execute(uint64_t handle) {
     @autoreleasepool {
+        snap_invalidate();  // (the CPU may have written anything since the last list)
         exec_list(handle, 0);
         if (nlinear_drawn) linear_drawn_write_back();  // (queue fences come after the list: nvnQueueFenceSync)
         static int sync_submit = -1;
