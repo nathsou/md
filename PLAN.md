@@ -386,6 +386,17 @@ Engine fixes it needed, all shared:
   the Nook Stop terminal, the airport and a Nook Miles Ticket flight to a mystery island, night time, Save and end,
   and the saved game loading again. `tools/acnh_saves.sh` repeats the boot, a walk, the phone and the pockets, day and
   night, for a folder of saves.
+- Frame generation (`frame_generation = 60 | 120` in nx.ini, `LARECOMP_FRAMEGEN`): ACNH steps its world once per
+  frame at 30 fps, so a real 60 fps needs every per-frame amount rescaled (a community mod does it for 3.0.x with
+  ~6,400 code patches and 1,437 parameter values). Instead, runtime/nvn/framegen.m makes images between the game's
+  frames: a quarter-size luminance pyramid of each frame, coarse-to-fine block-matching flow both ways (5x5 patches,
+  a bias to no motion so the HUD stays put, a 3x3 median), then each in-between image samples both frames along the
+  flows (Super SloMo's approximation) and blends them by time and forward-backward consistency; a large average match
+  error (a cut) shows the nearer frame instead. metal.m's present is now a layout step plus one present per image,
+  scheduled a display frame apart (the real frame keeps its old deadline). Capped at the display's refresh rate
+  (NSScreen.maximumFramesPerSecond); off when the game runs uncapped (Dread). Checked: 30 game / 60 shown fps, even
+  quarter steps of a pan at 4 images per frame (LARECOMP_FG_SHOTS saves them). Not checked on a visible display yet
+  (LARECOMP_LOG_SHOWN=1 logs the real on-screen intervals).
 - Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
   that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
   back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one

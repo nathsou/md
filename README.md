@@ -94,6 +94,17 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
    such as Animal Crossing's camera app, to `save/<game>/album/`), settings to `nx.ini`, shader caches to
    `cache/<game>/`, all in the repository folder.
 
+## Settings
+
+`nx.ini` (written on first launch, in the repository folder) holds the options; there is no in-game menu yet.
+
+- `frame_generation = off | 60 | 120`: for a game that runs at 30 fps (Animal Crossing), images are generated between
+  its frames from the motion between them, so the window shows 60 or 120 a second (at most the display's refresh
+  rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency, and
+  fast-moving details (legs while running) can ghost a little in the generated images. No effect on a game already
+  presenting at that rate (Metroid Dread).
+- `resolution`: the internal rendering resolution (`match`: the window's size; `1x` to `4x`: 1080p to 4320p).
+
 ## Controls
 
 Any controller SDL recognises (Nintendo layout by position: right face button = A, bottom = B, top = X, left = Y), or

@@ -876,9 +876,11 @@ volatile uint64_t g_nvn_presents;  // presents so far (cmdbuf.c's list origins, 
 // a game in its 30 fps mode (interval 2) runs at 30 whatever the display. Unless the game runs uncapped
 // (GAME_UNCAPPED_FPS, LARECOMP_UNCAPPED=1), the presenting thread waits here until its frame's vsync. On a 60 Hz grid:
 // a frame late by less than a vsync keeps the grid (it takes the next slot), a later one starts it over.
+volatile int g_present_interval;  // the game's present interval as paced here (0: uncapped): metal.m frame generation
 static void present_wait(int interval) {
     static int uncapped = -1;
     if (uncapped < 0) uncapped = game_flag(GAME_UNCAPPED_FPS) || (getenv("LARECOMP_UNCAPPED") && atoi(getenv("LARECOMP_UNCAPPED")));
+    g_present_interval = uncapped ? 0 : interval;
     if (uncapped || interval < 1) return;
     const uint64_t vsync = 16666667;
     static uint64_t due;  // when this frame may be shown (the last one's + its interval)
