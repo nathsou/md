@@ -103,7 +103,10 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
   rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency, and
   fast-moving details (legs while running) can ghost a little in the generated images. No effect on a game already
   presenting at that rate (Metroid Dread).
-- `resolution`: the internal rendering resolution (`match`: the window's size; `1x` to `4x`: 1080p to 4320p).
+- `resolution`: the internal rendering resolution. `match` (default) follows the window's size; `1x` to `4x` render
+  at 1080, 2160 (4K), 3240 or 4320 lines whatever the window, scaled to fit it; `dynamic`, `75%`, `50%` and `25%`
+  lower it from `match` for slower GPUs. The game still lays out its screen for 1080p, so the HUD and text are
+  rendered sharper, not smaller.
 
 ## Controls
 

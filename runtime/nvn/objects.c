@@ -835,6 +835,13 @@ NVN(nvnWindowInitialize) {
     w->interval = (int)G(uint32_t, A(1), 0x20);
     w->active = G(uint32_t, A(1), 0x24) ? (int)G(uint32_t, A(1), 0x24) : w->num;
     SET_HOST(A(0), w);
+    for (int i = 0; i < w->num; i++) {  // (screen images: at the output resolution, nvn.h NVN_TEX_HOST_WINDOW)
+        NvnTexture *t = HOST(NvnTexture, w->textures[i]);
+        if (!t) continue;
+        t->flags |= NVN_TEX_HOST_WINDOW;
+        extern bool renderer_texture_promote_scalable(NvnTexture *t);
+        if (t->backend) renderer_texture_promote_scalable(t);
+    }
     LOG("[nvn] window with %d textures, present interval %d\n", w->num, w->interval);
     RET(1);
 }

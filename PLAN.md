@@ -397,6 +397,11 @@ Engine fixes it needed, all shared:
   (NSScreen.maximumFramesPerSecond); off when the game runs uncapped (Dread). Checked: 30 game / 60 shown fps, even
   quarter steps of a pan at 4 images per frame (LARECOMP_FG_SHOTS saves them). Not checked on a visible display yet
   (LARECOMP_LOG_SHOWN=1 logs the real on-screen intervals).
+- Output resolution and window textures: the scaler picks screen-sized render targets by NVN's compressible flag
+  (0x8); ACNH's window textures have none, so its scene rendered at 4K was composited with the HUD into 1080p window
+  images (and scaled up again to the window). Textures given to an NVN window now carry a host-only flag
+  (NVN_TEX_HOST_WINDOW) and are scaled too: `resolution = 2x` gives a real 3840x2160 image (30 fps on an M4 Pro,
+  frame generation and camera photos included).
 - Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
   that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
   back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one
