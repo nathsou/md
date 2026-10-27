@@ -503,6 +503,26 @@ static void release_backend_texture(NvnTexture *t, TexBackend *b) {  // (also dr
     (void)t;
 }
 
+// A texture tex_scalable left at its guest size (no compressible flag: an R8 mask, ACNH's depth-of-field weights) drawn
+// into in one pass with scaled attachments of its size: Metal draws a pass only over its smallest attachment, so the
+// pass covered the top-left 1 / scale of the others (ACNH: black bands over the blurred distance, on the right and at
+// the bottom). It becomes scalable: reallocated at the output scale (its contents start cleared; GPU-drawn targets).
+bool renderer_texture_promote_scalable(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    if (b->scalable || t->target != 1 || t->samples > 1 || t->width < 32 || t->height < 16 || getenv("LARECOMP_NO_SCALE"))
+        return false;
+    float a = (float)t->width / (float)t->height;
+    if (a <= 1.74f || a >= 1.81f) return false;
+    static int nlog;
+    if (nlog++ < 10) LOG("[metal] texture %ux%u fmt %#x (%s): drawn with scaled targets, now scaled too\n", t->width, t->height,
+                         t->format, t->label);
+    release_backend_texture(t, b);
+    b->scalable = true;
+    create_backend_texture(t, b);
+    b->uploaded = false;
+    return true;
+}
+
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
     renderer_texture_gone(t, NULL);  // its snapshot copy
@@ -1151,6 +1171,32 @@ static float g_shot_frac[2] = {1, 1};        // the part of the game image its c
 static bool g_save_upright;  // (set around saves of the window image: test shots under any name)
 // LARECOMP_DEBUG_NAN (debug frames): an RGBA16Float image's non-finite / negative texel counts and largest value
 static void float_stats(id<MTLTexture> tex, const char *path) {
+    if (tex.pixelFormat == MTLPixelFormatR32Float && tex.textureType == MTLTextureType2D && getenv("LARECOMP_DEBUG_NAN")) {
+        NSUInteger w = tex.width, h = tex.height, row = w * 4;  // (one float: its stats and a 5x4 grid)
+        id<MTLBuffer> buf = [dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        [b copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                  toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+        [b endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float *px = buf.contents;
+        size_t nan = 0, inf = 0;
+        float mn = INFINITY, mx = -INFINITY;
+        for (size_t i = 0; i < w * h; i++) {
+            if (px[i] != px[i]) nan++;
+            else if (isinf(px[i])) inf++;
+            else { if (px[i] < mn) mn = px[i]; if (px[i] > mx) mx = px[i]; }
+        }
+        LOG("[nan] %s: %zu NaN, %zu inf, min %g max %g; grid:", path, nan, inf, mn, mx);
+        for (int gy = 0; gy < 4; gy++) {
+            for (int gx = 0; gx < 5; gx++) LOG(" %.4g", px[(h * (2 * gy + 1) / 8) * w + w * (2 * gx + 1) / 10]);
+            LOG(" |");
+        }
+        LOG("\n");
+        return;
+    }
     bool packed = tex.pixelFormat == MTLPixelFormatRG11B10Float;
     if ((tex.pixelFormat != MTLPixelFormatRGBA16Float && !packed) || tex.textureType != MTLTextureType2D ||
         !getenv("LARECOMP_DEBUG_NAN"))

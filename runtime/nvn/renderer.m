@@ -805,6 +805,27 @@ static void begin_pass(void) {
     pass_depth = st.rt.depth;
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     int w = 0, h = 0;
+    {   // attachments of one guest size, some scaled and some not: all scaled (metal.m renderer_texture_promote_scalable)
+        extern bool renderer_texture_promote_scalable(NvnTexture *t);
+        NvnTexture *at[9];
+        int n = 0;
+        bool scaled = false;
+        for (int i = -1; i < st.rt.ncolor && n < 9; i++) {
+            NvnTexture *t = i < 0 ? st.rt.depth : st.rt.color[i];
+            if (!t) continue;
+            float sx, sy;
+            renderer_texture_scale(t, &sx, &sy);
+            if (sx != 1 || sy != 1) scaled = true;
+            at[n++] = t;
+        }
+        for (int i = 0; scaled && i < n; i++)
+            for (int k = 0; k < n; k++)
+                if (k != i && at[k]->width == at[i]->width && at[k]->height == at[i]->height) {
+                    float sx, sy;
+                    renderer_texture_scale(at[k], &sx, &sy);
+                    if (sx != 1 || sy != 1) { renderer_texture_promote_scalable(at[i]); break; }
+                }
+    }
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         if (!t) continue;
@@ -832,6 +853,9 @@ static void begin_pass(void) {
             stat_clears_as_load++;
         }
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+        if (g_debug_frame)
+            LOG("[rt] color %d: %ux%u f%#x target %u flags %#x %s -> metal %lux%lu type %lu\n", i, t->width, t->height, t->format,
+                t->target, t->flags, t->label, (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.textureType);
         if (!w) renderer_texture_scale(t, &pass_sx, &pass_sy);
         w = (int)tex.width; h = (int)tex.height;
     }
@@ -2177,12 +2201,16 @@ static void bind_textures(int stage, ShaderInfo *si) {
                         LOG("[dtex] linear texture stride %u -> %s\n", e->tex->stride, rp);
                     }
                 }
-                LOG("[dtex] slot %d tex %ux%u f%#x addr %llx size %llu nonzero %llu gpu_owned %d\n", i, e->tex->width,
-                    e->tex->height, e->tex->format, e->tex->addr, total, nz, renderer_is_gpu_owned(e->tex));
+                LOG("[dtex] slot %d tex %ux%u f%#x addr %llx size %llu nonzero %llu gpu_owned %d levels %u view %s%u+%u\n", i,
+                    e->tex->width, e->tex->height, e->tex->format, e->tex->addr, total, nz, renderer_is_gpu_owned(e->tex),
+                    e->tex->levels, e->has_view && (e->view.setmask & 1) ? "" : "(none) ", e->view.base_level, e->view.num_levels);
             }
         }
         NvnSamplerDesc *sd = h && st.spool && tsc < (uint32_t)st.spool->count ? &((NvnSamplerDesc *)st.spool->entries)[tsc] : NULL;
         if (sd) smp = sampler_for(sd);
+        if (g_debug_frame && sd && stage == 1)
+            LOG("[dtex] slot %d sampler lod %g..%g bias %g, metal texture levels %lu\n", i, sd->lod_min, sd->lod_max, sd->lod_bias,
+                (unsigned long)tex.mipmapLevelCount);
         if (st_->shadow) tex = shadow_slot_texture(tex, st_, i, h);
         if (!tex) tex = dummy_texture(st_->type);
         if (!smp) smp = default_sampler();
@@ -3617,6 +3645,8 @@ static void draw(CmdRec *r, bool indexed) {
         }
         if (fkey.flip_x) rs[65][0] = (float)st.rt.color[0]->width;  // (mirror mode: the composite's width, guest pixels)
         [enc setFragmentBytes:rs length:(NSUInteger)(fkey.flip_x ? 66 : 1 + pr->fi->ntex) * 16 atIndex:RSCALE_BUFFER_INDEX];
+        if (g_debug_frame)
+            for (int i = 0; i <= pr->fi->ntex && i < 8; i++) LOG("[rscale] %d: %g %g %g %g\n", i, rs[i][0], rs[i][1], rs[i][2], rs[i][3]);
     }
     // (uniform buffer 2 = the model matrix - only when the vertex shader reads it: a binding left from an earlier draw
     // is another object's matrix)
