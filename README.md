@@ -138,6 +138,11 @@ hitch on a first visit. To avoid that:
   [ZacharyACoon/MetroidDreadSaveFiles](https://github.com/ZacharyACoon/MetroidDreadSaveFiles)) from a scratch copy of
   its save, continues it, explores for a few minutes (`EXPLORE=<seconds>`) and captures frames to `build/cp/<NNN>/`;
   `GAME_DIR=data/dread-2.1.0` runs another version.
+- `tools/acnh_saves.sh <dir> [jobs]` (Animal Crossing): boots each save folder (`main.dat`, `mainHeader.dat`,
+  `Villager*/`: a save dump, or a copy of `save/acnh/save_0`) from a scratch copy, in the day and at night, walks the
+  island, opens the phone and the pockets, and captures frames to `build/acnh_cp/<save>-{day,night}/`. A resident
+  belongs to the Switch account that made it: the runner plays as that account (`LARECOMP_USER_ID`, which
+  `tools/acnh_save.py <save dir>` prints), so the game doesn't start a new resident instead.
 - `LARECOMP_INPUT="frame:BUTTON:frames,..."` scripts the controller, `LARECOMP_SHOT_AT=frame,...` saves screenshots;
   `LARECOMP_RECORD=<file>` records your inputs while you play and `LARECOMP_REPLAY=<file>` plays them back.
   `LARECOMP_TIME_OFFSET=<seconds>` shifts the clock the game sees (Animal Crossing's time of day).

@@ -372,7 +372,18 @@ Engine fixes it needed, all shared:
   an 8x8x8 3D texture left bound to a 2D slot of a UI shader reads the dummy (undefined on the Switch too).
 - Testing aids: `LARECOMP_HIDDEN=1 LARECOMP_DISPLAY_SYNC=0 LARECOMP_UNCAPPED=1` runs the intro at 120 fps off screen;
   `LARECOMP_LIVE=<dir>` steers a running game (lines appended to `<dir>/cmd`: `A 6`, `STICK_UP 300`, `wait 60`,
-  `shot name`). ACNH's island differs per new game (its randomness is time-based too), so scripts can't navigate.
+  `shot name`; holds run one after another, `+NAME n` together with the previous one). A new game's island is random
+  (its randomness is time-based too), so scripts can't navigate one: tests start from saves instead.
+- Saves made elsewhere: each resident is tied to the account that made it (main.dat keeps 8 slots of 0x48 bytes:
+  account ID, island and player identity; `tools/acnh_save.py` decrypts a save, the NHSE scheme, and prints them).
+  `LARECOMP_USER_ID` makes our one account that one; without it the game moves a new resident in. Loading a save from
+  an older version, the game asks to upgrade it and commits every mount together through fsp-srv's
+  OpenMultiCommitManager (1200, now implemented); then a loaded resident asks for the controller's colours
+  (`nn::hid::GetNpadControllerColor`, HLE: the SDK aborted on the unset attribute). Checked with a public April 2020
+  save (ericlewis/acnh-save-backups, 1.1-era) on 2.0.7: upgrade, island, house, Nook's Cranny, Resident Services,
+  the Nook Stop terminal, the airport and a Nook Miles Ticket flight to a mystery island, night time, Save and end,
+  and the saved game loading again. `tools/acnh_saves.sh` repeats the boot, a walk, the phone and the pockets, day and
+  night, for a folder of saves.
 
 ### Generator
 - Jump tables whose bounds check sits far above the `br` (compilers schedule the per-case register setup in between:

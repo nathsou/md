@@ -658,8 +658,9 @@ static void host_test_frame(uint64_t frame) {
 }
 
 // LARECOMP_LIVE=<dir> (tests): steering a running game. Lines appended to <dir>/cmd are read as they arrive:
-// "<BUTTON or STICK_*> <frames>" holds it from the next frame on (LARECOMP_INPUT's names), "wait <frames>" delays the
-// lines after it, "shot <name>" saves the next game image as <dir>/<name>.png; <dir>/frame gets the current frame.
+// "<BUTTON or STICK_*> <frames>" holds it after the previous hold (LARECOMP_INPUT's names; "+<name> <frames>" starts
+// with the previous one instead, to combine them), "wait <frames>" delays the lines after it, "shot <name>" saves the
+// next game image as <dir>/<name>.png; <dir>/frame gets the current frame.
 // The holds join LARECOMP_INPUT's script (same syntax inside), so the two can be combined.
 static char live_script[65536];
 static bool live_on;
@@ -668,7 +669,7 @@ static void live_frame(uint64_t frame) {
     static const char *dir;
     static int init;
     static long off;
-    static uint64_t at;  // (the frame the next line starts at: "wait" moves it)
+    static uint64_t at, last_at;  // (the frame the next line starts at: holds and "wait" move it; the last hold's start)
     if (!init) { init = 1; dir = getenv("LARECOMP_LIVE"); live_on = dir && *dir; }
     if (!live_on) return;
     char path[1100];
@@ -695,10 +696,16 @@ static void live_frame(uint64_t frame) {
             if (sscanf(line, "%*s %63s", nm) == 1) snprintf(g_live_shot, sizeof g_live_shot, "%s/%s.png", dir, nm);
             continue;
         }
+        bool with_previous = name[0] == '+';
+        const char *button = name + with_previous;
+        uint64_t start = with_previous ? last_at : at;
+        if (!n) n = 6;
         size_t l = strlen(live_script);
         if (l + 64 < sizeof live_script)
-            snprintf(live_script + l, sizeof live_script - l, "%s%llu:%s:%lu", l ? "," : "", (unsigned long long)at, name, n ? n : 6);
-        LOG("[input] live: %s for %lu frames at frame %llu\n", name, n ? n : 6, (unsigned long long)at);
+            snprintf(live_script + l, sizeof live_script - l, "%s%llu:%s:%lu", l ? "," : "", (unsigned long long)start, button, n);
+        LOG("[input] live: %s for %lu frames at frame %llu\n", button, n, (unsigned long long)start);
+        last_at = start;
+        if (start + n > at) at = start + n;
     }
     fclose(f);
 }
