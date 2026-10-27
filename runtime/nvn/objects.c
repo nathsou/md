@@ -6,6 +6,7 @@
 #include "../kernel.h"
 #include "../game.h"
 #include "../platform.h"
+#include "../settings.h"
 #include "nvn.h"
 #include "rqueue.h"
 
@@ -884,10 +885,25 @@ volatile uint64_t g_nvn_presents;  // presents so far (cmdbuf.c's list origins, 
 // (GAME_UNCAPPED_FPS, LARECOMP_UNCAPPED=1), the presenting thread waits here until its frame's vsync. On a 60 Hz grid:
 // a frame late by less than a vsync keeps the grid (it takes the next slot), a later one starts it over.
 volatile int g_present_interval;  // the game's present interval as paced here (0: uncapped): metal.m frame generation
+// The menu's frame rate limit (a game running at the display's rate: Dread): no sooner than 1 / limit after the last.
+static void limit_wait(void) {
+    static uint64_t due;  // (on a grid of 1 / limit: a late frame starts it over)
+    int cap = g_settings.fps_cap;
+    if (cap <= 0) { due = 0; return; }
+    uint64_t now = plat_now_ns(), period = 1000000000ull / cap;
+    if (due > now) {
+        extern void kernel_block_begin(void), kernel_sched_point(void);
+        kernel_block_begin();
+        plat_sleep_until_ns(due);
+        kernel_sched_point();
+    } else if (now - due >= period) due = now;
+    due += period;
+}
 static void present_wait(int interval) {
     static int uncapped = -1;
     if (uncapped < 0) uncapped = game_flag(GAME_UNCAPPED_FPS) || (getenv("LARECOMP_UNCAPPED") && atoi(getenv("LARECOMP_UNCAPPED")));
     g_present_interval = uncapped ? 0 : interval;
+    if (uncapped && !getenv("LARECOMP_UNCAPPED")) limit_wait();
     if (uncapped || interval < 1) return;
     const uint64_t vsync = 16666667;
     static uint64_t due;  // when this frame may be shown (the last one's + its interval)
@@ -917,6 +933,19 @@ NVN(nvnQueuePresentTexture) {
                 LOG("[window] present %d: texture %d at %#llx%s\n", i, k, (unsigned long long)HOST(NvnTexture, w->textures[k])->addr, k == i ? " <-" : "");
     }
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    // The in-game menu pauses the game: its frame loop waits here, the window showing its last frame under the menu
+    // (the core is given up meanwhile, as in a kernel wait)
+    extern bool menu_pauses_game(void);
+    extern int rt_reboot_requested(void);
+    if (menu_pauses_game()) {
+        extern void kernel_block_begin(void), kernel_sched_point(void), backend_represent(void);
+        kernel_block_begin();
+        while (menu_pauses_game() && !rt_reboot_requested()) {
+            backend_represent();
+            plat_sleep_until_ns(plat_now_ns() + 16000000ull);
+        }
+        kernel_sched_point();
+    }
 }
 
 // ================================================================== small state objects

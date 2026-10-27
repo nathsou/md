@@ -7,6 +7,7 @@
 #include "rt.h"
 
 GameInfo g_game;
+const char *menu_game_name(void) { return g_game.name[0] ? g_game.name : "(no game)"; }  // (runtime/ui/menu.mm)
 
 #ifdef __APPLE__
 extern const GameProfile *const __start_games[] __asm__("section$start$__DATA$__rt_games");

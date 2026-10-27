@@ -8,7 +8,13 @@ the game runs as a native program.
 | Game | Versions | State |
 |---|---|---|
 | **Metroid Dread** | 1.0.0, 2.1.0 | Playable from the opening to the last area (54 save checkpoints checked) |
-| **Animal Crossing: New Horizons** | 1.0.0, 2.0.7 | Playable: the intro, character creation, the opening movie, arriving on the island and playing there |
+| **Animal Crossing: New Horizons** | 1.0.0, 2.0.7 | Playable: the intro, the island, shops, flights, photos; saves from a Switch load |
+
+| Metroid Dread | Animal Crossing: New Horizons |
+|---|---|
+| ![Metroid Dread: Artaria, the opening area](docs/screenshots/dread.jpg) | ![Animal Crossing: New Horizons: a morning on the island](docs/screenshots/acnh.jpg) |
+
+<sub>Running in nx on an M4 Pro Mac. Metroid Dread and Animal Crossing: New Horizons © Nintendo.</sub>
 
 Any other game boots through the same engine without a profile (its title ID and code come from its own files); a
 profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#adding-a-game)).
@@ -22,17 +28,6 @@ profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#
 > This project was built almost entirely with AI (Anthropic's Claude, through Claude Code), directed and reviewed by a
 > human. It is an early, experimental work in progress: expect bugs.
 
-![Metroid Dread's title screen](docs/screenshots/title.jpg)
-
-| | |
-|---|---|
-| ![Artaria, the opening area](docs/screenshots/artaria.jpg) | ![Cataris](docs/screenshots/cataris.jpg) |
-| ![Ghavoran](docs/screenshots/ghavoran.jpg) | ![Ferenia](docs/screenshots/ferenia.jpg) |
-| ![Itorash, near the end of the game](docs/screenshots/itorash.jpg) | |
-
-<sub>Metroid Dread running in nx on an M4 Pro Mac (from the opening to the last area, captured by
-`tools/checkpoints.sh`). Metroid Dread © Nintendo.</sub>
-
 ## Status
 
 - **Metroid Dread** boots, plays its movies, runs the title screen, save files and the whole game's areas, and is
@@ -40,13 +35,16 @@ profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#
   the 832 unique shader stages it ships translates to Metal and compiles. Checked against a ladder of 54 save files
   spanning the whole game: each loads and runs minutes of scripted play without crashing and renders correctly
   (`tools/checkpoints.sh`). Nobody has finished the game on it yet.
-- **Animal Crossing: New Horizons** boots to the title screen, runs the whole intro (Tom Nook's questions, name and
-  birthday, the character creator, the island choice), plays the opening movie with its audio and lands on the island,
-  where you can walk around and play, at 120 fps.
+- **Animal Crossing: New Horizons** runs the whole intro (Tom Nook's questions, typing your name, the character
+  creator, the island choice), the opening movie and the island: houses, shops, Resident Services, the airport and
+  mystery-island flights, the NookPhone and its camera (photos saved as PNGs), day and night. It runs at its own 30 fps,
+  shown at 60 or 120 with frame generation, at up to 4K. Saves from a Switch load as their resident's account
+  (`tools/acnh_save.py`). Checked with `tools/acnh_saves.sh`.
+- **In-game menu** (F1 or Esc, or Minus + Plus on a controller): saves and backups, the game's date and time, video,
+  audio and controls. See [Settings and the menu](#settings-and-the-menu).
 - **Game updates** are applied when extracting (`--update`): the update's code and its romfs patch over the base
   game's.
-- Not done: an in-game menu, online features, Linux and Windows (the Vulkan backend
-  from LASRecomp is there but has not been built).
+- Not done: online features, Linux and Windows (the Vulkan backend from LASRecomp is there but has not been built).
 
 See [PLAN.md](PLAN.md) for the design, the full status and the known problems.
 
@@ -90,27 +88,57 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
    ./build/nx data/acnh
    ```
 
-   The app picks the game library built for those game files. Saves go to `save/<game>/` (photos taken in a game,
-   such as Animal Crossing's camera app, to `save/<game>/album/`), settings to `nx.ini`, shader caches to
-   `cache/<game>/`, all in the repository folder.
+   The app picks the game library built for those game files. Saves go to `save/<game>/` (see [Saves](#saves)),
+   settings to `nx.ini`, shader caches to `cache/<game>/`, all in the repository folder.
 
-## Settings
+## Settings and the menu
 
-`nx.ini` (written on first launch, in the repository folder) holds the options; there is no in-game menu yet.
+Press **F1** or **Esc** (or **Minus + Plus** together on a controller) for the in-game menu. The game pauses under it
+and its sound is muted (Game tab: uncheck the option to keep it running). Changes apply at once and are saved to
+`nx.ini` in the repository folder.
 
-- `frame_generation = off | 60 | 120`: for a game that runs at 30 fps (Animal Crossing), images are generated between
-  its frames from the motion between them, so the window shows 60 or 120 a second (at most the display's refresh
-  rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency. No
-  effect on a game already presenting at that rate (Metroid Dread).
-- `frame_generation_method = metalfx | flow`: how. `metalfx` (default, macOS 26 or later): at 60, Apple's MetalFX frame
-  interpolation, fed with the game's depth and with motion vectors nx draws for it (each object's vertex shader runs
-  again with the previous frame's data) and the HUD apart, so it stays still; the cleanest images, and lighter on the
-  GPU than `flow`; drawing the motion vectors costs the game about 5% of its frame rate. `flow`, and 120 in any case: images from the optical flow between the frames; fast-moving details
-  (legs while running) can ghost a little.
-- `resolution`: the internal rendering resolution. `match` (default) follows the window's size; `1x` to `4x` render
-  at 1080, 2160 (4K), 3240 or 4320 lines whatever the window, scaled to fit it; `dynamic`, `75%`, `50%` and `25%`
-  lower it from `match` for slower GPUs. The game still lays out its screen for 1080p, so the HUD and text are
-  rendered sharper, not smaller.
+- **Game**: resume, restart the game, quit.
+- **Saves**: the current save, backups, restoring one (see [Saves](#saves)).
+- **Date & time**: the clock the game sees - this Mac's, or a date and time of your own (Animal Crossing's seasons,
+  shops and events follow it). Animal Crossing reads it when it starts, as on a Switch: the tab has a button to
+  restart the game with the new clock.
+- **Video**:
+  - *Resolution*: `Match the window` (default) follows the window's size; `1080p` to `4x` draw at 1080, 2160 (4K),
+    3240 or 4320 lines whatever the window; `Dynamic`, `75%`, `50%` and `25%` lower it for slower GPUs. The game lays
+    out its screen for 1080p, so the HUD and text get sharper, not smaller.
+  - *Upscaler* (bilinear or MetalFX), *anti-aliasing* (SMAA), *shape* (fill the window or 16:9 with bars).
+  - *Frame rate limit* (the display's refresh rate, 120, 60, 30) for games that run at the display's rate (Metroid
+    Dread). Animal Crossing runs at 30 fps whatever this says.
+  - *Frame generation* (off, 60, 120): for a game that runs at 30 fps (Animal Crossing), images are generated between
+    its frames, so the window shows 60 or 120 a second (at most the display's refresh rate) while the game itself
+    still runs at 30, its speed unchanged, for about one display frame of latency. *MetalFX* (default, macOS 26 or
+    later, 60 only) uses Apple's MetalFX frame interpolation, fed with the game's depth, motion vectors nx draws for
+    it and the HUD apart so it stays still: the cleanest images, and about 5% of the game's frame rate. *Optical
+    flow* also does 120; fast details (legs while running) can ghost a little.
+  - *Show the frame rate*.
+- **Audio**: volume, room reverb.
+- **Controls**: the keyboard's controls, vibration, which button confirms in the menu, the language the game is told.
+
+In `nx.ini` the same options are `resolution`, `upscaler`, `antialias`, `aspect`, `frame_rate_limit`,
+`frame_generation`, `frame_generation_method`, `show_fps`, `volume`, `reverb`, `time_offset` (seconds), `language`,
+`pause_in_menu`, and the key and controller bindings (`bind_key_*` / `bind_pad_*`).
+
+## Saves
+
+A game's saves live in `save/<game>/` in the repository folder (`save/acnh/`, `save/dread/`): one folder per save
+data the game opens (Animal Crossing's and Metroid Dread's `save_0`), in the same layout as on a Switch, so a save
+copied from a console can be dropped in. The game writes them when it saves, as on a Switch, through a working copy
+that only replaces the saved files once the game commits them (a crash or quit mid-save leaves the last good save).
+Photos taken in a game (Animal Crossing's camera app) go to `save/<game>/album/`.
+
+The menu's **Saves** tab shows the current save and keeps backups in `save/<game>/backups/<date> - <name>/`: *Back up
+now* copies the save there; *Restore* copies a backup back and restarts the game (the current save is backed up
+first, so a restore can be undone); *Delete* removes one; *Open the saves folder* shows it in Finder. A save folder
+copied into `backups/` by hand appears in the list too.
+
+Animal Crossing ties each resident to the Switch account that created it: to play a save from a console, run nx as
+that account with `LARECOMP_USER_ID=<id>` (`tools/acnh_save.py <save folder>` prints it), or the game starts a new
+resident.
 
 ## Controls
 
@@ -130,7 +158,8 @@ the keyboard:
 
 Typing: where a game asks for text with its own on-screen keyboard (the name in Animal Crossing's intro, its chat),
 type it on the keyboard; letters, digits, space, punctuation and Backspace go to the text while it's open (Enter
-confirms). Rebind in `nx.ini` (`bind_key_*` / `bind_pad_*` lines). F11 toggles fullscreen. A controller SDL doesn't know can be
+confirms). F1 or Esc opens the [menu](#settings-and-the-menu); F11 toggles fullscreen. Rebind in `nx.ini` (`bind_key_*` /
+`bind_pad_*` lines). A controller SDL doesn't know can be
 added with a mapping line in `gamecontrollerdb.txt` ([SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)).
 
 ## Shaders
@@ -166,7 +195,7 @@ hitch on a first visit. To avoid that:
   `tools/acnh_save.py <save dir>` prints), so the game doesn't start a new resident instead.
 - `LARECOMP_INPUT="frame:BUTTON:frames,..."` scripts the controller, `LARECOMP_SHOT_AT=frame,...` saves screenshots;
   `LARECOMP_RECORD=<file>` records your inputs while you play and `LARECOMP_REPLAY=<file>` plays them back.
-  `LARECOMP_TIME_OFFSET=<seconds>` shifts the clock the game sees (Animal Crossing's time of day).
+  `LARECOMP_TIME_OFFSET=<seconds>` shifts the clock the game sees (instead of the menu's setting).
 - More test hooks (per-pass frame dumps, a virtual gamepad, shader debugging) are listed in PLAN.md.
 
 ## How it works
