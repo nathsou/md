@@ -18,6 +18,7 @@
 #include "rqueue.h"
 #include "renderer.h"
 #include "framegen.h"
+#include "motion.h"
 #include "pace.h"
 #include "texpatch.h"
 #include "tex_hash.h"
@@ -880,6 +881,7 @@ id<MTLCommandQueue> renderer_queue(void) { return queue; }
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 static NvnTexture *g_last_presented;
+NvnTexture *renderer_presented_texture(void) { return g_last_presented; }  // (renderer.m: the screen's size)
 // Every game texture goes (the NvnTexture structs themselves are leaked: guest memory pointed at them), the
 // renderer drops what is keyed by guest addresses / objects, and the heap wrapper is let go: guest memory is
 // about to be replaced (backend_guest_memory_reset wraps the new pages).
@@ -1617,7 +1619,17 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         if (n > 1) {
             id<MTLCommandBuffer> fcb = [queue commandBuffer];
             [fcb addCompletedHandler:^(id<MTLCommandBuffer> done) { renderer_gpu_busy(done, true); }];
+            extern NvnTexture *fg_presented;
+            fg_presented = t;
             if (!framegen_prepare(dev, fcb, raw, n)) n = 1;
+            static int fg_time = -1;  // LARECOMP_FG_TIME=1: the in-between images' GPU time, averaged over 60 frames
+            if (fg_time < 0) fg_time = getenv("LARECOMP_FG_TIME") != NULL;
+            if (fg_time)
+                [fcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                    static double sum; static int cnt;
+                    sum += done.GPUEndTime - done.GPUStartTime;
+                    if (++cnt == 60) { LOG("[framegen] %.2f ms of GPU a frame\n", sum / cnt * 1000); sum = 0; cnt = 0; }
+                }];
             [fcb commit];
         } else framegen_reset();
         double t0 = CACurrentMediaTime(), period = interval / 60.0 / n;
@@ -1636,6 +1648,26 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
                     snprintf(path, sizeof path, "%s/fg_%05llu_%d.png", dir, (unsigned long long)frame, k);
                     save_png(k == n ? raw : framegen_image(k), path);
                 }
+            }
+    }
+    {   // LARECOMP_MV_SHOTS=<frame>,...: the motion vectors of those frames -> frames dir mv_<frame>.png (motion.h)
+        static const char *mv_shots;
+        if (!mv_shots) mv_shots = getenv("LARECOMP_MV_SHOTS") ? getenv("LARECOMP_MV_SHOTS") : "";
+        for (const char *q = mv_shots; *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : "")
+            if ((uint64_t)atoll(q) == frame) {
+                extern id<MTLTexture> renderer_motion(id<MTLTexture> *depth);
+                id<MTLTexture> d = nil, m = renderer_motion(&d);
+                const char *dir = getenv("LARECOMP_FRAMES_DIR") ? getenv("LARECOMP_FRAMES_DIR") : "build/frames";
+                char path[1100];
+                snprintf(path, sizeof path, "%s/mv_%05llu.png", dir, (unsigned long long)frame);
+                mkdir(dir, 0755);
+                if (m) mv_save(m, path);
+                else LOG("[mv] frame %llu: no motion\n", (unsigned long long)frame);
+                extern id<MTLTexture> renderer_ui_layer(NvnTexture *presented, id<MTLTexture> *scene, id<MTLTexture> *hud);
+                id<MTLTexture> sc = nil, hd = nil, ui = renderer_ui_layer(t, &sc, &hd);
+                snprintf(path, sizeof path, "%s/ui_%05llu.png", dir, (unsigned long long)frame);
+                if (ui) mv_save_coverage(ui, path);
+                else LOG("[mv] frame %llu: no UI layer\n", (unsigned long long)frame);
             }
     }
     frames++;

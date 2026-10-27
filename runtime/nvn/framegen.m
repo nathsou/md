@@ -9,11 +9,14 @@
 // frame. When the frames differ too much for the flow (a scene cut, a menu opening), a GPU-side check shows the previous
 // or the new frame instead of a blend.
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #include <stdlib.h>
 
 #include "../hle.h"
 #include "../settings.h"
 #include "framegen.h"
+#include "motion.h"
+#include "nvn.h"
 
 #define LEVELS 5
 #define MAX_IMAGES 4
@@ -102,6 +105,26 @@ static const char *fg_src =
     "    float2 uv = float2((id << 1) & 2, id & 2);\n"
     "    V v; v.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); v.uv = uv; return v;\n"
     "}\n"
+    // where the HUD's image differs from the scene's composite before it: HUD too (its parts that leave alpha alone)
+    "fragment float fg_hud_diff(V in [[stage_in]], texture2d<float> scene [[texture(0)]], texture2d<float> hud [[texture(1)]]) {\n"
+    "    uint2 p = uint2(in.pos.xy);\n"
+    "    float3 d = abs(hud.read(p).rgb - scene.read(p).rgb);\n"
+    "    return max(d.r, max(d.g, d.b)) > 1.5 / 255.0 ? 1.0 : 0.0;\n"
+    "}\n"
+    // the HUD for MetalFX: the shown image's colour, with the UI layer's coverage or the difference's, feathered over
+    // two pixels (no seam between the HUD's surroundings, this frame's, and the in-between image's)
+    "fragment float4 fg_ui(V in [[stage_in]], texture2d<float> ui [[texture(0)]], texture2d<float> img [[texture(1)]],\n"
+    "                      texture2d<float> diff [[texture(2)]], constant uint &has_diff [[buffer(0)]]) {\n"
+    "    uint2 p = uint2(in.pos.xy);\n"
+    "    int2 m = int2(img.get_width() - 1, img.get_height() - 1);\n"
+    "    float a = saturate(ui.read(p).a);\n"
+    "    if (has_diff)\n"
+    "        for (int y = -2; y <= 2; y++)\n"
+    "            for (int x = -2; x <= 2; x++)\n"
+    "                if (diff.read(uint2(clamp(int2(p) + int2(x, y), int2(0), m))).r > 0.5)\n"
+    "                    a = max(a, 1.0 - max(abs(x), abs(y)) / 3.0);\n"
+    "    return a > 0.004 ? float4(img.read(p).rgb * a, a) : float4(0);\n"  // (premultiplied: MetalFX's)
+    "}\n"
     "struct P { float t, sigma, cut; uint pixels; };\n"
     // flows in level-0 texels (a quarter of the image): their uv offsets are f / flow size
     "fragment float4 fg_blend(V in [[stage_in]], texture2d<float> i0 [[texture(0)]], texture2d<float> i1 [[texture(1)]],\n"
@@ -176,6 +199,130 @@ static void dispatch(id<MTLComputeCommandEncoder> c, id<MTLComputePipelineState>
     [c dispatchThreads:MTLSizeMake(out.width, out.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 }
 
+// MetalFX frame interpolation (macOS 26), with the game's depth and the motion vectors of motion.h: the image halfway
+// between the previous game frame and this one. (One image: 60 fps from 30.) nil: not this frame (no motion vectors -
+// a menu, a loading screen - or no interpolator), the optical flow's instead.
+static id<MTLFXFrameInterpolator> fx;
+NvnTexture *fg_presented;  // (metal.m: the game image being shown - its UI layer, renderer.m)
+static id<MTLTexture> fx_out;
+static bool fx_failed;
+bool framegen_metalfx(void) {  // (LARECOMP_FG_METALFX=0 / 1: instead of the setting)
+    static int env = -2;
+    if (env == -2) env = getenv("LARECOMP_FG_METALFX") ? atoi(getenv("LARECOMP_FG_METALFX")) != 0 : -1;
+    if (fx_failed || (env >= 0 ? !env : g_settings.frame_gen_flow)) return false;
+    static int supported = -1;
+    if (supported < 0) {
+        extern id<MTLDevice> renderer_device(void);
+        id<MTLDevice> dev = renderer_device();
+        if (!dev) return false;
+        supported = [MTLFXFrameInterpolatorDescriptor supportsDevice:dev] ? 1 : 0;
+        LOG("[framegen] MetalFX frame interpolation %s\n", supported ? "available" : "not supported on this GPU: optical flow");
+    }
+    return supported;
+}
+
+// Motion vectors are drawn (motion.h) while MetalFX makes the in-between image: one per frame of a 30 fps game
+bool framegen_wants_motion(void) {
+    extern volatile int g_present_interval;
+    return framegen_metalfx() && framegen_factor(g_present_interval) == 2;
+}
+// The HUD for MetalFX to lay over its image (premultiplied alpha): the game image's colours where the UI layer (renderer.m
+// renderer_ui_layer) has coverage
+static id<MTLTexture> ui_image(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> ui, id<MTLTexture> scene,
+                               id<MTLTexture> hud, id<MTLTexture> cur) {
+    static id<MTLRenderPipelineState> pipe, pdiff;
+    static MTLPixelFormat pipe_format;
+    static id<MTLTexture> out, diff;
+    if (!ui || ui.width != cur.width || ui.height != cur.height) return nil;
+    if (!pipe || pipe_format != cur.pixelFormat) {
+        NSError *e = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:@(fg_src) options:nil error:&e];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"fg_vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"fg_ui"];
+        pd.colorAttachments[0].pixelFormat = cur.pixelFormat;
+        pipe = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [lib newFunctionWithName:@"fg_hud_diff"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+        pdiff = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pipe_format = cur.pixelFormat;
+        if (!pipe || !pdiff) { LOG("[framegen] UI image pipeline: %s\n", e.localizedDescription.UTF8String); pipe = nil; return nil; }
+    }
+    uint32_t has_diff = scene && hud && scene.width == cur.width && scene.height == cur.height;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (has_diff) {
+        diff = tex(dev, diff, MTLPixelFormatR8Unorm, cur.width, cur.height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+        rp.colorAttachments[0].texture = diff;
+        id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+        [e setRenderPipelineState:pdiff];
+        [e setFragmentTexture:scene atIndex:0];
+        [e setFragmentTexture:hud atIndex:1];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+    }
+    out = tex(dev, out, cur.pixelFormat, cur.width, cur.height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    rp.colorAttachments[0].texture = out;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:pipe];
+    [e setFragmentTexture:ui atIndex:0];
+    [e setFragmentTexture:cur atIndex:1];
+    [e setFragmentTexture:has_diff ? diff : ui atIndex:2];
+    [e setFragmentBytes:&has_diff length:4 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return out;
+}
+
+static id<MTLTexture> metalfx_image(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> prev, id<MTLTexture> cur, bool reset) {
+    extern id<MTLTexture> renderer_motion(id<MTLTexture> *depth);
+    id<MTLTexture> depth = nil, motion = renderer_motion(&depth);
+    // (the scene's size: a menu's small 3D view - a model, the title's island - goes to the optical flow)
+    if (!motion || !depth || fx_failed || motion.width != cur.width || motion.height != cur.height) return nil;
+    extern id<MTLTexture> renderer_ui_layer(NvnTexture *presented, id<MTLTexture> *scene, id<MTLTexture> *hud);
+    id<MTLTexture> scene = nil, hud = nil, layer = renderer_ui_layer(fg_presented, &scene, &hud);
+    id<MTLTexture> ui = ui_image(dev, cb, layer, scene, hud, cur);
+    if (!fx || fx.inputWidth != motion.width || fx.inputHeight != motion.height || fx.outputWidth != cur.width ||
+        fx.outputHeight != cur.height || fx.colorTextureFormat != cur.pixelFormat || fx.depthTextureFormat != depth.pixelFormat) {
+        MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
+        d.colorTextureFormat = cur.pixelFormat;
+        d.outputTextureFormat = cur.pixelFormat;
+        d.depthTextureFormat = depth.pixelFormat;
+        d.motionTextureFormat = motion.pixelFormat;
+        d.inputWidth = motion.width, d.inputHeight = motion.height;
+        d.outputWidth = cur.width, d.outputHeight = cur.height;
+        d.uiTextureFormat = cur.pixelFormat;  // (ui_image: the game image's)
+        fx = [d newFrameInterpolatorWithDevice:dev];
+        if (!fx) { LOG("[framegen] MetalFX interpolator: not created (depth format %lu)\n", (unsigned long)depth.pixelFormat); fx_failed = true; return nil; }
+        LOG("[framegen] MetalFX interpolator %lux%lu -> %lux%lu (usage: color %#lx depth %#lx motion %#lx output %#lx; ours %#lx %#lx %#lx)\n",
+            (unsigned long)motion.width, (unsigned long)motion.height, (unsigned long)cur.width, (unsigned long)cur.height,
+            (unsigned long)fx.colorTextureUsage, (unsigned long)fx.depthTextureUsage, (unsigned long)fx.motionTextureUsage,
+            (unsigned long)fx.outputTextureUsage, (unsigned long)cur.usage, (unsigned long)depth.usage, (unsigned long)motion.usage);
+        reset = true;
+    }
+    fx_out = tex(dev, fx_out, cur.pixelFormat, cur.width, cur.height, fx.outputTextureUsage | MTLTextureUsageShaderRead);
+    fx.colorTexture = cur;
+    fx.prevColorTexture = prev;
+    fx.depthTexture = depth;
+    fx.motionTexture = motion;
+    fx.outputTexture = fx_out;
+    fx.motionVectorScaleX = (float)motion.width;  // (motion.h: uv offsets to the previous position)
+    fx.motionVectorScaleY = (float)motion.height;
+    fx.deltaTime = 1 / 30.0f;
+    fx.nearPlane = 1, fx.farPlane = 1000;  // (the game's camera isn't known: a plausible one)
+    fx.fieldOfView = 30, fx.aspectRatio = (float)cur.width / cur.height;
+    fx.depthReversed = NO;  // (cleared to 1, drawn with LESS)
+    fx.jitterOffsetX = fx.jitterOffsetY = 0;
+    fx.uiTexture = ui;
+    // (MetalFX draws the HUD over its image. The image has it too, moved with the scene under it: covered where the HUD
+    // is opaque. Saying so - uiTextureComposited, for MetalFX to take it off - gave black images on macOS 27.0.)
+    fx.uiTextureComposited = NO;
+    fx.shouldResetHistory = reset;
+    [fx encodeToCommandBuffer:cb];
+    return fx_out;
+}
+
 bool framegen_prepare(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> cur, int n) {
     if (!build(dev) || n < 2) return false;
     int ni = cur_i < 0 ? 0 : cur_i ^ 1;
@@ -207,6 +354,18 @@ bool framegen_prepare(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture>
     }
     int pi = ni ^ 1;
     bool ok = fits && have_prev;
+    if (framegen_metalfx() && n == 2 && ok) {
+        [c endEncoding];
+        static bool last_fx;
+        id<MTLTexture> img = metalfx_image(dev, cb, hist[pi], hist[ni], !last_fx);
+        last_fx = img != nil;
+        if (img) {
+            images[1] = img;
+            cur_i = ni;
+            return true;
+        }
+        c = [cb computeCommandEncoder];
+    }
     if (ok) {  // the flows, coarse to fine: [0] previous -> current, [1] current -> previous
         for (int d = 0; d < 2; d++)
             for (int l = LEVELS - 1; l >= 0; l--) {

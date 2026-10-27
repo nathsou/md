@@ -100,9 +100,13 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
 
 - `frame_generation = off | 60 | 120`: for a game that runs at 30 fps (Animal Crossing), images are generated between
   its frames from the motion between them, so the window shows 60 or 120 a second (at most the display's refresh
-  rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency, and
-  fast-moving details (legs while running) can ghost a little in the generated images. No effect on a game already
-  presenting at that rate (Metroid Dread).
+  rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency. No
+  effect on a game already presenting at that rate (Metroid Dread).
+- `frame_generation_method = metalfx | flow`: how. `metalfx` (default, macOS 26 or later): at 60, Apple's MetalFX frame
+  interpolation, fed with the game's depth and with motion vectors nx draws for it (each object's vertex shader runs
+  again with the previous frame's data) and the HUD apart, so it stays still; the cleanest images, and lighter on the
+  GPU than `flow`; drawing the motion vectors costs the game about 5% of its frame rate. `flow`, and 120 in any case: images from the optical flow between the frames; fast-moving details
+  (legs while running) can ghost a little.
 - `resolution`: the internal rendering resolution. `match` (default) follows the window's size; `1x` to `4x` render
   at 1080, 2160 (4K), 3240 or 4320 lines whatever the window, scaled to fit it; `dynamic`, `75%`, `50%` and `25%`
   lower it from `match` for slower GPUs. The game still lays out its screen for 1080p, so the HUD and text are

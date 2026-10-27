@@ -410,6 +410,30 @@ Engine fixes it needed, all shared:
   (LARECOMP_SNAP_VERIFY=1 compares each shared snapshot with memory: one 256-byte buffer the game rewrites for its
   next frame while this one is translated differs, as it raced before). ACNH draws no motion vectors (one color
   target and depth for its scene), which MetalFX's frame interpolator and temporal scaler would need.
+- Motion vectors and MetalFX frame interpolation (runtime/nvn/motion.m, framegen.m; `frame_generation_method =
+  metalfx`, the default at 60): each program gets a variant whose vertex shader is the translated one as a function,
+  called with this frame's constant buffers and with the previous frame's copy of the same draw's (from one history
+  buffer, two free vertex buffer slots), and whose fragment shader writes the uv offset between the two positions to
+  colour attachment 7 (RG16Float) of the passes drawing with the scene's depth buffer - the frame before's with the
+  most depth-writing draws x pixels (ACNH's minimap, 386x386, has more draws than its view). Depth-writing draws
+  write it (ACNH: a depth prepass, then shading with EQUAL). Matching draws across frames: ACNH double-buffers its
+  uniform buffers (a draw alternates between two addresses) and draws the terrain's chunks with one mesh, so the
+  previous frame's draw is the one of the same shaders, mesh and range with the most uniform buffers of equal
+  contents (512-byte hashes: the world matrix of anything standing still), unmatched first. ~1,000 such draws a
+  frame, 99.9% matched. Checked by reprojection: frame N-1 warped by N's vectors on a camera pan, mean error 13.6 ->
+  2.3 (of 255); the character's limbs, the trees' wind sway and the camera all move right. Not covered: the sky
+  (no depth writes: no motion), shadows (they move with the ground under them), transparent effects.
+  The HUD: MetalFX moved it with the scene under it. A UI layer (RGBA16Float, coverage in alpha) is attached to the
+  passes into screen-sized images without depth; a full-screen opaque draw into a screen-sized image (ACNH's scene
+  composite into DTA[0] - in a pass that still has the scene's depth) takes it, empty, and a copy of its owner (into
+  the window image) keeps it; blended draws into the owner write their alpha to it too. The owner is also copied
+  before its first HUD pass: where the finished image differs from that copy is HUD as well (the clock's soft shadow
+  leaves alpha alone). MetalFX gets the shown image's colours, premultiplied, with that coverage feathered over two
+  pixels (no seam between the HUD's surroundings and the in-between image) - not the layer's colours: DTA[0] is
+  RGB10A2 (two bits of alpha) and the copy to the window changes the colours. uiTextureComposited off (on, MetalFX
+  on macOS 27.0 gave black images). One in-between image only: 120 stays
+  on the optical flow. Cost: uncapped 115 -> ~109 fps for the vectors; the in-between image's command buffer ~5.5 ms
+  of GPU span against ~9 ms for the flow (2560x1440, M4 Pro).
 - Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
   that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
   back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one

@@ -19,8 +19,10 @@
 #include "game.h"
 #include "recolour.h"
 #include "slowframe.h"
+#include "motion.h"
 
 static id<MTLDevice> dev;
+id<MTLDevice> renderer_device(void) { return dev; }
 static id<MTLCommandBuffer> cmdbuf;
 static id<MTLRenderCommandEncoder> enc;
 static id<MTLRenderPipelineState> clear_pipes[64];
@@ -126,10 +128,12 @@ const char *renderer_stats(void) {
     extern uint64_t g_tex_live_bytes;
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
+    uint64_t mvd, mvm, mvb;
+    mv_stats(&mvd, &mvm, &mvb);
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB ring %.0f MB (%llu new, %.0f MB reused) mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB ring %.0f MB (%llu new, %.0f MB reused) mv %llu/%llu %.1f MB mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
-             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, stat_ring_bytes / 1048576.0, (unsigned long long)stat_ring_new, stat_ring_reused / 1048576.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
+             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, stat_ring_bytes / 1048576.0, (unsigned long long)stat_ring_new, stat_ring_reused / 1048576.0, (unsigned long long)mvm, (unsigned long long)mvd, mvb / 1048576.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
              (unsigned long long)stat_counters_gpu, pace_is_slow() ? "30" : "60", (unsigned long long)pace_frames_over());
     stat_counters_gpu = 0;
     stat_compiles = 0;
@@ -815,6 +819,133 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
 // ------------------------------------------------------------------ render passes
 static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
+// Motion vectors (motion.h): passes drawing with the scene's depth buffer get the motion target as colour attachment
+// MV_TARGET, cleared by the frame's first of them.
+uint64_t renderer_exec_frame(void);
+static bool pass_mv;           // the open pass has the motion target
+static NvnTexture *mv_depth;   // the scene's depth buffer: the frame before's with the most depth-writing draws x pixels
+static id<MTLTexture> mv_tex;  // the motion target (the depth buffer's size)
+static id<MTLTexture> mv_depth_tex;  // (its Metal texture in the last motion pass)
+static uint64_t mv_clear_frame = ~0ull;
+
+static void mv_count(NvnTexture *d) {  // (a depth-writing draw into d)
+    static struct { NvnTexture *t; uint32_t n; } c[8];
+    static uint64_t frame = ~0ull;
+    uint64_t f = renderer_exec_frame();
+    if (f != frame) {
+        int best = -1;
+        for (int i = 0; i < 8; i++)  // (by draws times pixels: Animal Crossing's minimap has more draws than its view)
+            if (c[i].t && (best < 0 || (double)c[i].n * c[i].t->width * c[i].t->height > (double)c[best].n * c[best].t->width * c[best].t->height))
+                best = i;
+        NvnTexture *nd = best >= 0 ? c[best].t : NULL;
+        if (nd != mv_depth) LOG("[mv] scene depth %p (%ux%u, %u draws)\n", (void *)nd, nd ? nd->width : 0, nd ? nd->height : 0, best >= 0 ? c[best].n : 0);
+        mv_depth = nd;
+        memset(c, 0, sizeof c);
+        frame = f;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (c[i].t == d) { c[i].n++; return; }
+        if (!c[i].t) { c[i].t = d; c[i].n = 1; return; }
+    }
+}
+
+static bool mv_attach(MTLRenderPassDescriptor *rp) {
+    if (!mv_enabled() || !mv_depth || st.rt.depth != mv_depth || !st.rt.ncolor || st.rt.ncolor > MV_TARGET) return false;
+    id<MTLTexture> d = rp.depthAttachment.texture ?: rp.stencilAttachment.texture;
+    if (!d || d.sampleCount > 1 || d.textureType != MTLTextureType2D) return false;
+    for (int i = 0; i < st.rt.ncolor; i++) {
+        id<MTLTexture> c = rp.colorAttachments[i].texture;
+        if (c && (c.sampleCount > 1 || c.width != d.width || c.height != d.height)) return false;
+    }
+    if (!mv_tex || mv_tex.width != d.width || mv_tex.height != d.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MV_FORMAT width:d.width height:d.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        mv_tex = [dev newTextureWithDescriptor:td];
+        mv_tex.label = @"motion";
+        LOG("[mv] motion target %lux%lu\n", (unsigned long)d.width, (unsigned long)d.height);
+    }
+    uint64_t f = renderer_exec_frame();
+    MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[MV_TARGET];
+    a.texture = mv_tex;
+    a.loadAction = f == mv_clear_frame ? MTLLoadActionLoad : MTLLoadActionClear;
+    a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    a.storeAction = MTLStoreActionStore;
+    mv_clear_frame = f;
+    mv_depth_tex = d;
+    return true;
+}
+
+// The UI layer (motion.h mv_fs_ui_msl): the HUD drawn over the scene, apart, so that MetalFX keeps it still. It belongs
+// to one screen-sized image at a time (ui_owner): a full-screen opaque draw into a screen-sized image without depth
+// (the scene's composite) takes it, cleared - or as it is when the draw reads the owner (a copy: the window image's);
+// the blended draws into the owner after that (the HUD) go to the layer too, their alpha as coverage. Passes into
+// screen-sized images without depth have it as attachment MV_TARGET.
+static bool pass_ui;
+static id<MTLTexture> ui_tex;
+static NvnTexture *ui_owner;
+static bool ui_clear;  // (the layer is to start empty: cleared by the owner's next pass with it - or there's no HUD)
+// The owner as the composite left it, before the HUD (copied at the owner's first pass with the layer), and the image
+// the HUD then went into: where the two differ is HUD too - its parts that leave alpha alone (the clock's shadow)
+static id<MTLTexture> ui_scene, ui_hud;
+static bool ui_scene_ok;
+
+static bool ui_attach(MTLRenderPassDescriptor *rp) {
+    extern NvnTexture *renderer_presented_texture(void);
+    NvnTexture *scr = renderer_presented_texture(), *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!mv_enabled() || !scr || !t0 || st.rt.depth || st.rt.ncolor > MV_TARGET || t0->width != scr->width || t0->height != scr->height)
+        return false;
+    id<MTLTexture> c = rp.colorAttachments[0].texture;
+    if (!c || c.sampleCount > 1 || c.textureType != MTLTextureType2D) return false;
+    if (!ui_tex || ui_tex.width != c.width || ui_tex.height != c.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:UI_FORMAT width:c.width height:c.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        ui_tex = [dev newTextureWithDescriptor:td];
+        ui_tex.label = @"ui layer";
+        ui_owner = NULL;
+        LOG("[mv] UI layer %lux%lu\n", (unsigned long)c.width, (unsigned long)c.height);
+    }
+    if (ui_clear && t0 == ui_owner) {  // (the HUD's first pass: the image without it)
+        if (!ui_scene || ui_scene.width != c.width || ui_scene.height != c.height || ui_scene.pixelFormat != c.pixelFormat) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:c.pixelFormat width:c.width height:c.height mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            ui_scene = [dev newTextureWithDescriptor:td];
+        }
+        id<MTLBlitCommandEncoder> bl = [cb() blitCommandEncoder];
+        [bl copyFromTexture:c toTexture:ui_scene];
+        [bl endEncoding];
+        ui_hud = c;
+        ui_scene_ok = true;
+    }
+    MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[MV_TARGET];
+    a.texture = ui_tex;
+    a.loadAction = ui_clear && t0 == ui_owner ? MTLLoadActionClear : MTLLoadActionLoad;
+    a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    a.storeAction = MTLStoreActionStore;
+    if (t0 == ui_owner) ui_clear = false;
+    return true;
+}
+
+// (the HUD's coverage in alpha - its colours are the shown image's: Animal Crossing draws it into a 10-bit image with
+// two bits of alpha, and changes the colours in the copy to the window image. scene / hud: the image without and with
+// the HUD, nil when not known)
+id<MTLTexture> renderer_ui_layer(NvnTexture *presented, id<MTLTexture> *scene, id<MTLTexture> *hud) {
+    if (!presented || presented != ui_owner || ui_clear) return nil;
+    bool ok = ui_scene_ok && ui_hud && ui_hud.width == ui_scene.width && ui_hud.height == ui_scene.height;
+    *scene = ok ? ui_scene : nil;
+    *hud = ok ? ui_hud : nil;
+    return ui_tex;
+}
+
+// The frame's motion and depth (the frame being presented: translated up to its present), nil without any
+id<MTLTexture> renderer_motion(id<MTLTexture> *depth) {
+    if (!mv_tex || mv_clear_frame != renderer_exec_frame()) return nil;
+    *depth = mv_depth_tex;
+    return mv_tex;
+}
+
 static void begin_pass(void) {
     if (enc && !st.rt_dirty) return;
     opening_pass = true;  // (the chunk submit's end_pass below must not flush anything into this pass)
@@ -900,6 +1031,8 @@ static void begin_pass(void) {
         if (e && e->clear_on) { e->clear_on = false; td_pending--; stat_clears_as_load++; }
         if (!w) { renderer_texture_scale(st.rt.depth, &pass_sx, &pass_sy); w = (int)tex.width; h = (int)tex.height; }
     }
+    pass_mv = mv_attach(rp);
+    pass_ui = !pass_mv && ui_attach(rp);
     pass_rt_w = pass_rt_h = 0;
     if (!w) {
         pass_sx = pass_sy = 1;
@@ -1016,6 +1149,8 @@ static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
     }
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && st.rt.color[i]->samples > 1) pd.rasterSampleCount = st.rt.color[i]->samples;
+    if (pass_mv) pd.colorAttachments[MV_TARGET].pixelFormat = MV_FORMAT;
+    if (pass_ui) pd.colorAttachments[MV_TARGET].pixelFormat = UI_FORMAT;
 }
 
 // A full clear of texture t recorded for its next pass (an earlier one still recorded is replaced: it never ran).
@@ -1095,9 +1230,9 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         pd.colorAttachments[index].writeMask = m;
     }
     NSError *err;
-    NSString *key = [NSString stringWithFormat:@"clear %d %d %u %d %d %lu %lu %lu", index, kind, mask, depth, stencil,
+    NSString *key = [NSString stringWithFormat:@"clear %d %d %u %d %d %lu %lu %lu%s", index, kind, mask, depth, stencil,
                      (unsigned long)pd.colorAttachments[index < 0 ? 0 : index].pixelFormat,
-                     (unsigned long)pd.depthAttachmentPixelFormat, (unsigned long)pd.stencilAttachmentPixelFormat];
+                     (unsigned long)pd.depthAttachmentPixelFormat, (unsigned long)pd.stencilAttachmentPixelFormat, pass_mv ? " mv" : pass_ui ? " ui" : ""];
     id<MTLRenderPipelineState> pipe = cache[key];
     if (!pipe) {
         pipe = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&err]);
@@ -1162,6 +1297,13 @@ static int cbuf_base = 3, tex_base = 8;
     bool failed;
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
     ShaderFp fp[2];      // (stale-program detector, shader_prep.h; render thread only)
+    // motion vectors (motion.h): the variant's functions, its two extra vertex buffer slots; mv_state 0 not tried,
+    // 1 compiling, 2 ready, -1 none
+    id<MTLFunction> vs_mv, fs_mv;
+    _Atomic int mv_state;
+    id<MTLFunction> fs_ui[3];  // (the HUD's variant, by mode: blended, opaque, clear; ui_state as mv_state)
+    _Atomic int ui_state;
+    int mv_arena_slot, mv_off_slot;
 }
 @end
 @implementation Prog
@@ -1175,6 +1317,7 @@ static uint64_t ring_off;
 // until snap_epoch moves - a new ring or a reset of this one, a command that may write guest memory anywhere, a new
 // list - or a command writes their range (snap_wrote: uniform updates and counter reports, thousands a frame).
 static uint32_t snap_epoch = 1;
+static uint32_t ring_gen;  // (new rings: motion.h's ids of snapshots)
 static struct { uint64_t lo, hi; } snap_wlog[64];  // (ranges written since the epoch began, in order)
 static uint32_t snap_nw;
 static void snap_invalidate(void) { snap_epoch++; snap_nw = 0; }
@@ -1197,6 +1340,7 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
         aligned = 0;
         snap_invalidate();
         stat_ring_new++;
+        ring_gen++;
     }
     memcpy((uint8_t *)ring.contents + aligned, data, size);
     ring_off = aligned + size;
@@ -2648,6 +2792,17 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
     }
 }
 
+// The vertex stage's uniform snapshots of the draw (motion vectors: this frame's constants of the draw, motion.h)
+static const uint8_t *vcb_data[18];
+static uint32_t vcb_size[18], vcb_off[18];
+static uint64_t vcb_id[18];
+static void vcb_note(int k, uint64_t off, uint64_t size) {
+    vcb_data[k] = (const uint8_t *)ring.contents + off;
+    vcb_size[k] = (uint32_t)size;
+    vcb_off[k] = (uint32_t)off;
+    vcb_id[k] = (uint64_t)ring_gen << 32 | off;
+}
+
 static void bind_cbufs(int stage, ShaderInfo *si) {
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
@@ -2690,6 +2845,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if (!r.addr) {
             static const uint8_t zeros[0x10000];
             uint64_t off = ring_alloc(zeros, size ? size : 256);
+            if (stage == 0) vcb_note(k, off, size ? size : 256);
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
             else [enc setFragmentBuffer:ring offset:off atIndex:k];
             continue;
@@ -2698,6 +2854,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if (size > r.size && r.size) size = r.size;
         if (size < 16) size = 16;
         uint64_t off = snap_reuse(r.addr, size);  // snapshot, as later CPU writes must not leak in
+        if (stage == 0) vcb_note(k, off, size);
         if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
         else [enc setFragmentBuffer:ring offset:off atIndex:k];
     }
@@ -3309,6 +3466,101 @@ static id prep_find_pipe(NSString *body) {
     return p;
 }
 
+// The program's motion variant (motion.h), built off the render thread on first use: true once it's ready
+static bool prog_mv_ready(Prog *pr) {
+    int state = pr->mv_state;
+    if (state == 2) return true;
+    if (state != 0) return false;
+    pr->mv_state = -1;
+    if (!pr->vi || !pr->fi || !pr->vi->msl || !pr->fi->msl || pr->vi->uses_gmem_store) return false;
+    int slot[2], n = 0;  // (two vertex buffer slots the program's uniform buffers leave free)
+    for (int k = 16; k >= 3 && n < 2; k--) if (!(pr->vi->cbuf_mask & (1u << k))) slot[n++] = k;
+    if (n < 2) return false;
+    char *vs = mv_vs_msl(pr->vi->msl, pr->vi->cbuf_mask, slot[0], slot[1]), *fs = vs ? mv_fs_msl(pr->fi->msl) : NULL;
+    if (!vs || !fs) {
+        static int nlog;
+        if (nlog++ < 20) LOG("[mv] program %p: no motion variant (%s)\n", (__bridge void *)pr, vs ? "fragment" : "vertex");
+        free(vs); free(fs);
+        return false;
+    }
+    pr->mv_arena_slot = slot[0];
+    pr->mv_off_slot = slot[1];
+    pr->mv_state = 1;
+    static dispatch_queue_t q;
+    if (!q) q = dispatch_queue_create("larecomp.mv", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_async(q, ^{
+        static MTLCompileOptions *vopts;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
+        NSError *err = nil;
+        id<MTLLibrary> vl = [dev newLibraryWithSource:@(vs) options:vopts error:&err];
+        id<MTLLibrary> fl = vl ? [dev newLibraryWithSource:@(fs) options:nil error:&err] : nil;
+        if (!vl || !fl) {
+            static int nlog;
+            if (nlog++ < 10) LOG("[mv] variant compile failed: %s\n%s\n", err.localizedDescription.UTF8String, vl ? fs : vs);
+            pr->mv_state = -1;
+        } else {
+            pr->vs_mv = [vl newFunctionWithName:@"main0"];
+            pr->fs_mv = [fl newFunctionWithName:@"main0"];
+            pr->mv_state = pr->vs_mv && pr->fs_mv ? 2 : -1;
+        }
+        free(vs);
+        free(fs);
+    });
+    return false;
+}
+
+// The program's HUD variant (motion.h mv_fs_ui_msl), built like the motion one
+static bool prog_ui_ready(Prog *pr) {
+    int state = pr->ui_state;
+    if (state == 2) return true;
+    if (state != 0) return false;
+    pr->ui_state = -1;
+    if (!pr->fi || !pr->fi->msl || pr->fi->ntex > MSL_MAX_SAMPLERS) return false;
+    char *fs = mv_fs_ui_msl(pr->fi->msl);
+    if (!fs) return false;
+    pr->ui_state = 1;
+    static dispatch_queue_t q;
+    if (!q) q = dispatch_queue_create("larecomp.ui", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_async(q, ^{
+        NSError *err = nil;
+        id<MTLLibrary> fl = [dev newLibraryWithSource:@(fs) options:nil error:&err];
+        bool ok = fl != nil;
+        for (int m = 0; ok && m < 3; m++) {
+            MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+            int v = m;
+            [cv setConstantValue:&v type:MTLDataTypeInt atIndex:0];
+            pr->fs_ui[m] = [fl newFunctionWithName:@"main0" constantValues:cv error:&err];
+            ok = pr->fs_ui[m] != nil;
+        }
+        if (!ok) {
+            static int nlog;
+            if (nlog++ < 10) LOG("[mv] UI variant compile failed: %s\n%s\n", err.localizedDescription.UTF8String, fs);
+        }
+        pr->ui_state = ok ? 2 : -1;
+        free(fs);
+    });
+    return false;
+}
+
+// A motion draw's previous-frame constants: the history's (motion.h) for the same draw - among the draws of its
+// shaders, vertex streams, index range and instances - bound beside this frame's
+static void mv_bind(Prog *pr, CmdRec *r, bool indexed, uint32_t used_streams) {
+    uint64_t c[2] = {st.program->stages[0].code_addr, st.program->stages[1].code_addr};
+    uint64_t h = hmix(0xcbf29ce484222325ull, c, sizeof c);
+    h = hmix(h, r->x, sizeof r->x[0] * (indexed ? 7 : 5));
+    for (int s = 0; s < 12; s++) if (used_streams & (1u << s)) h = hmix(h, &st.vbuf[s].addr, sizeof st.vbuf[s].addr);
+    id<MTLBuffer> ab = nil;
+    uint32_t offs[18] = {0};
+    bool matched = false;
+    if (!mv_record(renderer_exec_frame(), h, pr->vi->cbuf_mask, vcb_data, vcb_size, vcb_id, &ab, offs, &matched)) {
+        ab = ring;  // (the history is full: this frame's constants, no motion)
+        memcpy(offs, vcb_off, sizeof offs);
+    }
+    [enc setVertexBuffer:ab offset:0 atIndex:pr->mv_arena_slot];
+    [enc setVertexBytes:offs length:sizeof offs atIndex:pr->mv_off_slot];
+}
+
 static void draw(CmdRec *r, bool indexed) {
     if (!st.program) { SKIPPED(); return; }
     static bool logged_modes;
@@ -3437,7 +3689,33 @@ static void draw(CmdRec *r, bool indexed) {
     // draws depth only: no fragment function, as on the Switch - its own fragment shader's discards would drop depth
     // the prepass writes, and its colour work is wasted (nvn.h nvn_bind_program).
     bool depth_only = (st.bound_stages & 1) && !(st.bound_stages & 2);
-    uint64_t phash = pipeline_state_hash(pr) ^ (depth_only ? 0x9e3779b97f4a7c15ull : 0);
+    // motion vectors: depth-writing draws of the scene write them (the motion target is in every pass with the scene's
+    // depth: the other draws' pipelines have it too, masked)
+    if (mv_enabled() && st.rt.depth && st.ds[0] && st.ds[1] && st.rt.ncolor) mv_count(st.rt.depth);
+    bool mv_draw = pass_mv && !depth_only && st.ds[0] && st.ds[1] && prog_mv_ready(pr);
+    int ui_mode = -1;  // (the UI layer: -1 untouched, else the HUD variant's mode)
+    if (mv_enabled() && st.rt.ncolor && st.rt.color[0]) {
+        extern NvnTexture *renderer_presented_texture(void);
+        NvnTexture *t0 = st.rt.color[0], *scr = renderer_presented_texture();
+        bool composite = scr && t0->width == scr->width && t0->height == scr->height && r->x[2] <= 6 && st.viewport[0][0] == 0 &&
+                         st.viewport[0][1] == 0 && st.viewport[0][2] >= t0->width && st.viewport[0][3] >= t0->height &&
+                         !(st.color_state[0] & 1) && pr->fi->ntex;
+        if (composite) {  // (the scene's composite, in its own pass or not; a copy of the owner keeps the layer)
+            bool copy = false;
+            for (int i = 0; i < pr->fi->ntex && !copy; i++) copy = ui_owner && shader_texture_object(1, &pr->fi->tex[i]) == ui_owner;
+            if (!copy) {
+                ui_clear = true;
+                ui_scene_ok = false;
+                if (pass_ui) ui_mode = 2, ui_clear = false;
+            }
+            ui_owner = t0;
+        } else if (pass_ui && t0 == ui_owner && !depth_only) ui_mode = st.color_state[0] & 1 ? 0 : 1;
+        bool want_clear = ui_mode == 2;
+        if (ui_mode >= 0 && !prog_ui_ready(pr)) ui_mode = -1;
+        if (want_clear && ui_mode < 0) ui_clear = true;  // (no clear variant yet: no layer until a pass clears it)
+    }
+    uint64_t phash = pipeline_state_hash(pr) ^ (depth_only ? 0x9e3779b97f4a7c15ull : 0) ^ (pass_mv ? 0x5bd1e9955bd1e995ull : 0) ^
+                     (mv_draw ? 0x27d4eb2f165667c5ull : 0) ^ (pass_ui ? 0x165667b19e3779f9ull : 0) ^ (uint64_t)(ui_mode + 1) * 0x85ebca77c2b2ae63ull;
     uint32_t pslot = (uint32_t)(phash ^ (phash >> 29)) & (PIPE_TAB - 1);
     while (pipe_tab[pslot].key && pipe_tab[pslot].key != phash) pslot = (pslot + 1) & (PIPE_TAB - 1);
     id<MTLRenderPipelineState> pipe = pipe_tab[pslot].key ? (__bridge id<MTLRenderPipelineState>)pipe_tab[pslot].pipe : nil;
@@ -3448,8 +3726,26 @@ static void draw(CmdRec *r, bool indexed) {
     attachment_formats(pd);
     pipeline_desc(pd, pr, &rec);
     if (depth_only) pd.fragmentFunction = nil;
+    if (pass_mv) pd.colorAttachments[MV_TARGET].writeMask = mv_draw ? MTLColorWriteMaskRed | MTLColorWriteMaskGreen : MTLColorWriteMaskNone;
+    if (mv_draw) pd.vertexFunction = pr->vs_mv, pd.fragmentFunction = pr->fs_mv;
+    if (pass_ui) {  // (the layer gets target 0's colour: blended with its colour factors, alpha as coverage)
+        MTLRenderPipelineColorAttachmentDescriptor *u = pd.colorAttachments[MV_TARGET], *c0 = pd.colorAttachments[0];
+        u.writeMask = ui_mode >= 0 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+        if (ui_mode == 0) {
+            u.blendingEnabled = YES;
+            u.sourceRGBBlendFactor = c0.sourceRGBBlendFactor;
+            u.destinationRGBBlendFactor = c0.destinationRGBBlendFactor;
+            u.rgbBlendOperation = c0.rgbBlendOperation;
+            u.sourceAlphaBlendFactor = MTLBlendFactorOne;
+            u.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            u.alphaBlendOperation = MTLBlendOperationAdd;
+        }
+        if (ui_mode >= 0) pd.fragmentFunction = pr->fs_ui[ui_mode];
+    }
     NSString *body = pipeline_key(pd, pr);
     if (depth_only) body = [body stringByAppendingString:@" depth-only"];
+    if (mv_draw) body = [body stringByAppendingString:@" mv"];
+    if (ui_mode >= 0) body = [body stringByAppendingFormat:@" ui%d", ui_mode];
     NSString *pk = [NSString stringWithFormat:@"%u %@", g_boot_gen, body];
     id pobj = cache[pk];
     NSMutableDictionary *ready_pipes = g_ready_pipes;  // async pipeline builds finished on Metal's threads
@@ -3464,7 +3760,7 @@ static void draw(CmdRec *r, bool indexed) {
         if (pobj == pending) pobj = nil;  // (a draw that must run: built here as well)
     }
     if (!pobj) {
-        if (shader_rec_recording()) shader_rec_note(&rec);
+        if (shader_rec_recording() && !mv_draw && ui_mode < 0) shader_rec_note(&rec);
         pobj = prep_find_pipe(body);  // prepared before the game
         if (pobj) cache[pk] = pobj;
         else shader_first_visit("pipeline", rec.vs, rec.fs, shader_code_hash((const uint8_t *)body.UTF8String, body.length));
@@ -3611,6 +3907,7 @@ static void draw(CmdRec *r, bool indexed) {
     // resources
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
+    if (mv_draw) mv_bind(pr, r, indexed, used_streams);
     // (debug, LARECOMP_LOG_BINDS) shaders loading global memory read through pointers in their uniform buffers: note
     // 4 KB at each heap pointer found in the bound uniforms, to see whether the game rewrites that data per frame
     if (pr->vi->uses_gmem || pr->fi->uses_gmem) {
@@ -4752,6 +5049,9 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
 }
 
 void renderer_reset(void) {
+    mv_depth = NULL;  // (motion vectors: no scene, no history)
+    ui_owner = NULL;
+    mv_reset();
     memset(td_tab, 0, sizeof td_tab);  // (recorded clears and depth guesses of the old boot's textures)
     td_pending = 0;
     nlinear_drawn = 0;
