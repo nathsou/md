@@ -1356,6 +1356,7 @@ void backend_represent(void) {
 static int g_presents_inflight;  // present command buffers committed and not yet completed (each holds a drawable)
 volatile int g_display_hz = 60;  // (the UI thread keeps it: the window's screen's highest refresh rate)
 static uint64_t g_images_shown;  // window images presented (the fps line: with frame generation, more than frames)
+void renderer_frame_counts(uint64_t *game, uint64_t *shown) { *game = total_frames, *shown = g_images_shown; }  // (the menu's fps)
 // One window image: `img` (a game image, or an in-between one from framegen.m) drawn into a drawable with the frame's
 // layout, the menu over it, presented at `at` (0: the usual one-frame deadline). real: the game's own image (test shots
 // and the per-frame diagnostics follow it only).

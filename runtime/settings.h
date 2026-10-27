@@ -34,6 +34,9 @@ typedef struct {
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int frame_gen;       // frame generation: 0 off, 60 / 120 (window images a second for a 30 fps game: runtime/nvn/framegen.m)
     bool frame_gen_flow;  // frame generation by optical flow only ("flow"); default "metalfx": MetalFX's, with motion vectors, at 60
+    int fps_cap;         // frame rate limit for games that run at the display's rate (Dread): 0 the display's, else 120 / 60 / 30
+    bool menu_pause;     // the game pauses while the in-game menu is open (runtime/ui/menu.mm)
+    long long time_offset;  // seconds the game's clock runs from this Mac's (Date & time: runtime/services/time.c)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;

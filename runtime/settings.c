@@ -37,6 +37,7 @@ Settings g_settings = {
     .controller_light = true,
     .menu_confirm = MENU_CONFIRM_CONTROLLER,
     .show_fps = false,
+    .menu_pause = true,
     .inv_keys = true,
     .tracker = true,
     .tracker_filters = -1,
@@ -169,6 +170,9 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "frame_generation")) g_settings.frame_gen = !strcmp(val, "off") ? 0 : atoi(val) >= 120 ? 120 : atoi(val) >= 60 ? 60 : 0;
         else if (!strcmp(key, "frame_generation_method")) g_settings.frame_gen_flow = !strcmp(val, "flow");
+        else if (!strcmp(key, "frame_rate_limit")) { int v = atoi(val); g_settings.fps_cap = v == 30 || v == 60 || v == 120 ? v : 0; }
+        else if (!strcmp(key, "pause_in_menu")) g_settings.menu_pause = atoi(val) != 0;
+        else if (!strcmp(key, "time_offset")) g_settings.time_offset = atoll(val);
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
@@ -234,6 +238,10 @@ void settings_save(void) {
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "frame_generation = %s\n", g_settings.frame_gen == 120 ? "120" : g_settings.frame_gen == 60 ? "60" : "off");
     fprintf(f, "frame_generation_method = %s\n", g_settings.frame_gen_flow ? "flow" : "metalfx");
+    if (g_settings.fps_cap) fprintf(f, "frame_rate_limit = %d\n", g_settings.fps_cap);
+    else fprintf(f, "frame_rate_limit = display\n");
+    fprintf(f, "pause_in_menu = %d\n", g_settings.menu_pause);
+    fprintf(f, "time_offset = %lld\n", g_settings.time_offset);
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);

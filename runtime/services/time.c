@@ -6,17 +6,21 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../settings.h"
 
 static const uint8_t clock_uuid[16] = {0x4c, 0x41, 0x52, 0x65, 0x63, 0x6f, 0x6d, 0x70, 1, 2, 3, 4, 5, 6, 7, 8};
 
 static int64_t steady_seconds(void) { return (int64_t)(rt_ticks() / 19200000ull); }
-// LARECOMP_TIME_OFFSET=<seconds> (tests): the guest's clock runs that far from the host's (games that follow the time of
-// day: ACNH's lighting, shops)
-static int64_t unix_now(void) {
-    static int64_t off = -1;
-    if (off == -1) off = getenv("LARECOMP_TIME_OFFSET") ? atoll(getenv("LARECOMP_TIME_OFFSET")) : 0;
-    return (int64_t)time(NULL) + off;
+// The guest's clock runs time_offset seconds from the host's (the menu's Date & time: games that follow the time of
+// day - ACNH's seasons, shops, lighting). LARECOMP_TIME_OFFSET=<seconds> (tests) instead of the setting.
+static int64_t time_offset(void) {
+    static int env = -1;
+    static int64_t env_off;
+    if (env < 0) env = getenv("LARECOMP_TIME_OFFSET") != NULL, env_off = env ? atoll(getenv("LARECOMP_TIME_OFFSET")) : 0;
+    return env ? env_off : (int64_t)g_settings.time_offset;
 }
+static int64_t unix_now(void) { return (int64_t)time(NULL) + time_offset(); }
+int64_t time_game_now(void) { return unix_now(); }  // (the menu's clock)
 
 static void write_system_context(uint8_t *p) {  // SystemClockContext (0x20)
     int64_t steady = steady_seconds();
@@ -25,8 +29,24 @@ static void write_system_context(uint8_t *p) {  // SystemClockContext (0x20)
     memcpy(p + 0x10, clock_uuid, 16);
 }
 
+static uint8_t *g_time_shmem;
+// The clock moved (the menu): the system clocks' contexts in shared memory again, as the time service's lock-free
+// update does - the other of the two slots, then the counter (readers take slot counter & 1)
+void time_offset_changed(void) {
+    uint8_t *m = g_time_shmem;
+    if (!m) return;
+    for (int c = 0; c < 2; c++) {
+        uint8_t *at = m + (c ? 0x80 : 0x38);
+        uint32_t n = *(volatile uint32_t *)at;
+        write_system_context(at + 8 + ((n + 1) & 1) * 0x20);
+        __atomic_store_n((uint32_t *)at, n + 1, __ATOMIC_RELEASE);
+    }
+    LOG("[time] clock offset %lld s\n", (long long)time_offset());
+}
+
 static void time_shmem_map(KSharedMem *s) {
     uint8_t *m = (uint8_t *)(uintptr_t)s->guest_addr;
+    g_time_shmem = m;
     LOG("[time] shared memory mapped at %llx\n", (unsigned long long)s->guest_addr);
     // 0x00: LockFreeAtomicType<SteadyClockContext{u64 internal_offset, uuid}>
     *(uint32_t *)m = 0;
@@ -138,7 +158,7 @@ static void timezone_service(Service *s, IpcReq *req, IpcResp *resp) {
 }
 
 static uint32_t g_shmem_handle;
-RT_ON_RESET(time_reset) { g_shmem_handle = 0; }
+RT_ON_RESET(time_reset) { g_shmem_handle = 0; g_time_shmem = NULL; }
 
 static void static_service(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
