@@ -32,6 +32,8 @@ typedef struct {
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     bool upscaler_auto;  // never chosen: the default for this GPU (settings_resolve_defaults); saved as "auto"
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
+    int frame_gen;       // frame generation: 0 off, 60 / 120 (window images a second for a 30 fps game: runtime/nvn/framegen.m)
+    bool frame_gen_flow;  // frame generation by optical flow only ("flow"); default "metalfx": MetalFX's, with motion vectors, at 60
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;

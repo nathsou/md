@@ -19,6 +19,8 @@ typedef struct IpcReq {
     uint32_t domain_obj;  // 0 if not a domain message
     uint32_t domain_in_objs[8];
     int ndomain_in;
+    struct Service *in_objects[8];  // objects sent with the request (domain ids or copied session handles), resolved
+    int nin_objects;
 } IpcReq;
 
 typedef struct Service Service;
@@ -73,6 +75,7 @@ static inline IpcBuf *in_buf(IpcReq *req, int i) {
 Service *service_new(const char *name, ServiceHandler h, void *state);
 Service *service_lookup(const char *name);  // from the registry (services/*.c)
 void ipc_return_object(IpcResp *resp, Service *s);
+void service_release(Service *s);  // drops a reference taken with s->refs++ (on_close runs on the last)
 
 typedef struct { const char *name; ServiceHandler handler; } ServiceDef;
 #ifdef __APPLE__

@@ -355,6 +355,91 @@ Engine fixes it needed, all shared:
   outside its lock (4 s stalls).
 - Time: `IStaticService` 400/401 (clock snapshots), `LARECOMP_TIME_OFFSET`.
 
+### ACNH fixes after the first play (PR acnh-fixes)
+- **Speed**: ACNH runs at 30 fps (window present interval 2) and steps per frame; presents now wait their 60 Hz
+  vsync slots unless the game opts out (`GAME_UNCAPPED_FPS`: Dread). Measured: a steady 30 fps, 34-35 ms frames.
+- **Black bands** over the blurred distance (depth of field) and blocky airport-wall shadows: a pass mixed a scaled
+  colour target with an unflagged R8 one, and Metal draws only over the smallest attachment; such textures are
+  promoted to scaled (metal.m `renderer_texture_promote_scalable`).
+- **Island flag / designs scrambled**: `LINEAR_RENDER_TARGET` (0x40) textures are pitch-linear, rows packed.
+- **Dark sea**: the sky panorama the water reflects samples `agl::env::CubeMap`, a cube array, as a cube: views now.
+- **Compute shared memory** (`LDS` / `STS`): a lighting kernel never translated.
+- Draws into targets not drawn the frame before (one-shot renders) wait for their shaders instead of being skipped.
+- Audio renderer effects ported from Ryujinx: I3DL2 reverb (5: rooms, ACNH and Dread), delay (3), biquad filter (6).
+  Its Cos / Sin take degrees and its Pow10 clamps (radians made the reverb's feedback network diverge: NaN after
+  ~50 s of Dread); a non-finite state resets the effect. Aux (2, Ryujinx's AuxiliaryBufferCommand): the mix goes to
+  the game through the send buffer's ring and comes back from the return buffer's (ACNH taps its 6-channel final mix
+  this way and returns it unchanged; before, the output buffers weren't written).
+- Known, not done:
+  an 8x8x8 3D texture left bound to a 2D slot of a UI shader reads the dummy (undefined on the Switch too).
+- Testing aids: `LARECOMP_HIDDEN=1 LARECOMP_DISPLAY_SYNC=0 LARECOMP_UNCAPPED=1` runs the intro at 120 fps off screen;
+  `LARECOMP_LIVE=<dir>` steers a running game (lines appended to `<dir>/cmd`: `A 6`, `STICK_UP 300`, `wait 60`,
+  `shot name`; holds run one after another, `+NAME n` together with the previous one). A new game's island is random
+  (its randomness is time-based too), so scripts can't navigate one: tests start from saves instead.
+- Saves made elsewhere: each resident is tied to the account that made it (main.dat keeps 8 slots of 0x48 bytes:
+  account ID, island and player identity; `tools/acnh_save.py` decrypts a save, the NHSE scheme, and prints them).
+  `LARECOMP_USER_ID` makes our one account that one; without it the game moves a new resident in. Loading a save from
+  an older version, the game asks to upgrade it and commits every mount together through fsp-srv's
+  OpenMultiCommitManager (1200, now implemented); then a loaded resident asks for the controller's colours
+  (`nn::hid::GetNpadControllerColor`, HLE: the SDK aborted on the unset attribute). Checked with a public April 2020
+  save (ericlewis/acnh-save-backups, 1.1-era) on 2.0.7: upgrade, island, house, Nook's Cranny, Resident Services,
+  the Nook Stop terminal, the airport and a Nook Miles Ticket flight to a mystery island, night time, Save and end,
+  and the saved game loading again. `tools/acnh_saves.sh` repeats the boot, a walk, the phone and the pockets, day and
+  night, for a folder of saves.
+- Frame generation (`frame_generation = 60 | 120` in nx.ini, `LARECOMP_FRAMEGEN`): ACNH steps its world once per
+  frame at 30 fps, so a real 60 fps needs every per-frame amount rescaled (a community mod does it for 3.0.x with
+  ~6,400 code patches and 1,437 parameter values). Instead, runtime/nvn/framegen.m makes images between the game's
+  frames: a quarter-size luminance pyramid of each frame, coarse-to-fine block-matching flow both ways (5x5 patches,
+  a bias to no motion so the HUD stays put, a 3x3 median), then each in-between image samples both frames along the
+  flows (Super SloMo's approximation) and blends them by time and forward-backward consistency; a large average match
+  error (a cut) shows the nearer frame instead. metal.m's present is now a layout step plus one present per image,
+  scheduled a display frame apart (the real frame keeps its old deadline). Capped at the display's refresh rate
+  (NSScreen.maximumFramesPerSecond); off when the game runs uncapped (Dread). Checked: 30 game / 60 shown fps, even
+  quarter steps of a pan at 4 images per frame (LARECOMP_FG_SHOTS saves them). Not checked on a visible display yet
+  (LARECOMP_LOG_SHOWN=1 logs the real on-screen intervals).
+- Output resolution and window textures: the scaler picks screen-sized render targets by NVN's compressible flag
+  (0x8); ACNH's window textures have none, so its scene rendered at 4K was composited with the HUD into 1080p window
+  images (and scaled up again to the window). Textures given to an NVN window now carry a host-only flag
+  (NVN_TEX_HOST_WINDOW) and are scaled too: `resolution = 2x` gives a real 3840x2160 image (30 fps on an M4 Pro,
+  frame generation and camera photos included).
+- Render thread: every draw copied its bound uniform buffers into the ring (indexed ones whole, up to 64 KB). ACNH
+  records each draw as its own small command list and binds the same 40 KB buffer to all of them: 55 MB copied a
+  frame, a new 64 MB ring every ~15 ms, a quarter of the render thread. renderer.m's snap_reuse shares a snapshot
+  until a command writes its range (uniform updates, counter reports, buffer clears and copies) or may write anywhere
+  (dispatches, fences, a new list). ACNH uncapped on an M4 Pro: 77 -> 115 fps at 1440p, 98 fps at 4K
+  (LARECOMP_SNAP_VERIFY=1 compares each shared snapshot with memory: one 256-byte buffer the game rewrites for its
+  next frame while this one is translated differs, as it raced before). ACNH draws no motion vectors (one color
+  target and depth for its scene), which MetalFX's frame interpolator and temporal scaler would need.
+- Motion vectors and MetalFX frame interpolation (runtime/nvn/motion.m, framegen.m; `frame_generation_method =
+  metalfx`, the default at 60): each program gets a variant whose vertex shader is the translated one as a function,
+  called with this frame's constant buffers and with the previous frame's copy of the same draw's (from one history
+  buffer, two free vertex buffer slots), and whose fragment shader writes the uv offset between the two positions to
+  colour attachment 7 (RG16Float) of the passes drawing with the scene's depth buffer - the frame before's with the
+  most depth-writing draws x pixels (ACNH's minimap, 386x386, has more draws than its view). Depth-writing draws
+  write it (ACNH: a depth prepass, then shading with EQUAL). Matching draws across frames: ACNH double-buffers its
+  uniform buffers (a draw alternates between two addresses) and draws the terrain's chunks with one mesh, so the
+  previous frame's draw is the one of the same shaders, mesh and range with the most uniform buffers of equal
+  contents (512-byte hashes: the world matrix of anything standing still), unmatched first. ~1,000 such draws a
+  frame, 99.9% matched. Checked by reprojection: frame N-1 warped by N's vectors on a camera pan, mean error 13.6 ->
+  2.3 (of 255); the character's limbs, the trees' wind sway and the camera all move right. Not covered: the sky
+  (no depth writes: no motion), shadows (they move with the ground under them), transparent effects.
+  The HUD: MetalFX moved it with the scene under it. A UI layer (RGBA16Float, coverage in alpha) is attached to the
+  passes into screen-sized images without depth; a full-screen opaque draw into a screen-sized image (ACNH's scene
+  composite into DTA[0] - in a pass that still has the scene's depth) takes it, empty, and a copy of its owner (into
+  the window image) keeps it; blended draws into the owner write their alpha to it too. The owner is also copied
+  before its first HUD pass: where the finished image differs from that copy is HUD as well (the clock's soft shadow
+  leaves alpha alone). MetalFX gets the shown image's colours, premultiplied, with that coverage feathered over two
+  pixels (no seam between the HUD's surroundings and the in-between image) - not the layer's colours: DTA[0] is
+  RGB10A2 (two bits of alpha) and the copy to the window changes the colours. uiTextureComposited off (on, MetalFX
+  on macOS 27.0 gave black images). One in-between image only: 120 stays
+  on the optical flow. Cost: uncapped 115 -> ~109 fps for the vectors; the in-between image's command buffer ~5.5 ms
+  of GPU span against ~9 ms for the flow (2560x1440, M4 Pro).
+- Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
+  that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
+  back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one
+  drawn every frame (the game reads the photo without a fence that holds the copy). caps:su writes the image as a PNG
+  to `save/<game>/album/` (before: a stub, and the memory held whatever was there before).
+
 ### Generator
 - Jump tables whose bounds check sits far above the `br` (compilers schedule the per-case register setup in between:
   29 instructions in ACNH 2.0.7) are found within `JT_WINDOW` (48) straight-line instructions instead of 16. Before,

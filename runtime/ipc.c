@@ -50,7 +50,7 @@ static uint32_t session_new(Service *s) {
     return kernel_new_handle(&k->obj);
 }
 
-static void service_release(Service *s) {
+void service_release(Service *s) {
     if (s && --s->refs == 0 && s->on_close) s->on_close(s);
 }
 
@@ -172,6 +172,13 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
         if (sess->domain) {
             target = req.domain_obj < 256 ? sess->domain->objs[req.domain_obj] : NULL;
             if (!target) { LOG("[ipc] domain object %u missing\n", req.domain_obj); return 0xE401; }
+            for (int i = 0; i < req.ndomain_in && i < 8; i++)
+                req.in_objects[req.nin_objects++] = req.domain_in_objs[i] < 256 ? sess->domain->objs[req.domain_in_objs[i]] : NULL;
+        } else {
+            for (int i = 0; i < req.ncopy; i++) {
+                KSession *o = (KSession *)handle_get(req.copy_handles[i]);
+                req.in_objects[req.nin_objects++] = o && o->obj.type == KOBJ_SESSION ? o->svc : NULL;
+            }
         }
         target->handler(target, &req, &resp);
         static int log_ipc = -1;  // LARECOMP_LOG_IPC=1 (debugging): every request and its result

@@ -16,7 +16,8 @@
 // third_party/ryujinx/LICENSE.txt).
 // Voices decode PCM16 / ADPCM wave buffers, resample to 48 kHz, and mix into their destination mix's
 // buffers; sub mixes route into their destination; the final mix feeds the device sink, which we
-// downmix to stereo and push to an SDL audio stream. Effects and splitters are not implemented.
+// downmix to stereo and push to an SDL audio stream. Effects: reverb, I3DL2 reverb, delay, biquad filter and aux (the
+// game's own processing); splitters are not implemented.
 #define WB_COUNT 4
 #define MIXBUF_MAX 24
 #define HIST 4
@@ -410,22 +411,340 @@ static void reverb_process(Reverb *rv, float *const *in, float *const *out, uint
     }
 }
 
+// ------------------------------------------------------------------ I3DL2 reverb (port of Ryujinx Reverb3dState / Command)
+typedef struct { float *buf; uint32_t sr, cur, last, count, max; } DelayLine3d;  // (its own index rules)
+static void d3_set(DelayLine3d *d, float ms) {
+    uint32_t n = (uint32_t)roundf(d->sr * ms);
+    if (d->max >= n) { d->count = n; d->last = (d->cur + n) % (d->max + 1); }
+}
+static void d3_init(DelayLine3d *d, uint32_t sr, float ms_max) {
+    d->sr = sr;
+    d->max = (uint32_t)roundf(sr * ms_max);
+    free(d->buf);
+    d->buf = calloc(d->max + 1, sizeof(float));
+    d->cur = d->last = 0;
+    d3_set(d, ms_max);
+}
+static float d3_read(DelayLine3d *d) { return d->buf[d->cur]; }
+static float d3_update(DelayLine3d *d, float v) {
+    d->buf[d->last++] = v;
+    float o = d3_read(d);
+    if (++d->cur >= d->max) d->cur = 0;
+    if (d->last >= d->max) d->last = 0;
+    return o;
+}
+static float d3_tap(DelayLine3d *d, uint32_t idx, int off) {
+    int t = (int)d->last - ((int)idx + off);
+    if (t < 0) t += (int)d->max + 1;
+    return t >= 0 && (uint32_t)t <= d->max ? d->buf[t] : 0;
+}
+typedef struct { DelayLine3d dl; float rate; } DecayDelay3d;
+static float dd3_update(DecayDelay3d *d, float v) {
+    float p = v - d->rate * d3_read(&d->dl);
+    return d3_update(&d->dl, p) + p * d->rate;
+}
+
+typedef struct {
+    uint8_t input[6], output[6];
+    uint16_t ch_max, ch;
+    uint32_t reserved, sample_rate;
+    float room_hf, hf_reference, decay_time, hf_decay_ratio, room_gain, reflections_gain, reverb_gain, diffusion,
+        reflection_delay, reverb_delay_time, density, dry_gain;
+} Reverb3dParam;  // (0x48 bytes, then a status byte)
+
+typedef struct {
+    int ready;
+    uint8_t raw[0x48];
+    Reverb3dParam p;
+    DelayLine3d fdn[4], pre, fc;
+    DecayDelay3d decay1[4], decay2[4];
+    uint32_t early_time[20], reflection_time;
+    float dry, prev_pre, prev_pre_gain, target_pre_gain, early_gain, late_gain, direct[4], current[4], out[4], prev_fb[4];
+} Reverb3d;
+
+static const float r3_fdn_min[4] = {5.0f, 6.0f, 13.0f, 14.0f}, r3_fdn_max[4] = {45.704f, 82.782f, 149.94f, 271.58f};
+static const float r3_decay1[4] = {17.0f, 13.0f, 9.0f, 7.0f}, r3_decay2[4] = {19.0f, 11.0f, 10.0f, 6.0f};
+static const float r3_early_times[20] = {0.017136f, 0.059154f, 0.16173f, 0.39019f, 0.42526f, 0.45541f, 0.68974f, 0.74591f,
+    0.83384f, 0.8595f, 0.0f, 0.075024f, 0.16879f, 0.2999f, 0.33744f, 0.3719f, 0.59901f, 0.71674f, 0.81786f, 0.85166f};
+static const float r3_early_gain[20] = {0.67096f, 0.61027f, 1.0f, 0.35680f, 0.68361f, 0.65978f, 0.51939f, 0.24712f, 0.45945f,
+    0.45021f, 0.64196f, 0.54879f, 0.92925f, 0.38270f, 0.72867f, 0.69794f, 0.5464f, 0.24563f, 0.45214f, 0.44042f};
+
+// (Ryujinx's FloatingPointHelper: Pow10 clamped to Nintendo's range, Cos / Sin of degrees)
+static float r3_pow10(float x) { return x >= 0.0f ? 1.0f : x <= -5.3f ? 0.0f : powf(10.0f, x); }
+static float r3_cos(float deg) { return cosf(deg * (float)M_PI / 180.0f); }
+static float r3_sin(float deg) { return sinf(deg * (float)M_PI / 180.0f); }
+
+static void reverb3d_update(Reverb3d *r) {
+    const Reverb3dParam *p = &r->p;
+    uint32_t sr = p->sample_rate / 1000;
+    float rate = (float)p->sample_rate;
+    r->dry = p->dry_gain;
+    memset(r->prev_fb, 0, sizeof r->prev_fb);
+    r->prev_pre = 0;
+    r->early_gain = r3_pow10(fminf(p->room_gain + p->reflections_gain, 5000.0f) / 2000.0f);
+    r->late_gain = r3_pow10(fminf(p->room_gain + p->reverb_gain, 5000.0f) / 2000.0f);
+    float hf_room = r3_pow10(p->room_hf / 2000.0f);
+    if (hf_room < 1.0f) {
+        float a = 1.0f - hf_room, b = 2.0f - 2.0f * hf_room * r3_cos(256.0f * p->hf_reference / rate);
+        float c = sqrtf(fmaxf(0, b * b - 4.0f * (1.0f - hf_room) * (1.0f - hf_room)));
+        r->prev_pre_gain = (b - c) / (2.0f * a);
+        r->target_pre_gain = 1.0f - r->prev_pre_gain;
+    } else {
+        r->prev_pre_gain = 0;
+        r->target_pre_gain = 1;
+    }
+    r->reflection_time = (uint32_t)roundf(sr * 1000.0f * (p->reflection_delay + p->reverb_delay_time));
+    float echo = 0.6f * p->diffusion * 0.01f;
+    for (int i = 0; i < 4; i++) {
+        d3_set(&r->fdn[i], r3_fdn_min[i] + p->density / 100 * (r3_fdn_max[i] - r3_fdn_min[i]));
+        uint32_t n = r->fdn[i].count + r->decay1[i].dl.count + r->decay2[i].dl.count;
+        float a = (-60.0f * n) / (p->decay_time * rate), b = a / p->hf_decay_ratio;
+        float c = r3_cos(64.0f * p->hf_reference / rate) / r3_sin(64.0f * p->hf_reference / rate);
+        float d = r3_pow10((b - a) / 40.0f), e = r3_pow10((b + a) / 40.0f) * 0.7071f;
+        r->direct[i] = e * (d * c + 1.0f) / (c + d);
+        r->current[i] = e * (1.0f - d * c) / (c + d);
+        r->out[i] = (c - d) / (c + d);
+        r->decay1[i].rate = echo;
+        r->decay2[i].rate = echo * -0.9f;
+    }
+    for (int i = 0; i < 4; i++)
+        if (!isfinite(r->direct[i]) || !isfinite(r->current[i]) || !isfinite(r->out[i]) || !isfinite(r->late_gain)) {
+            static int nlog;
+            if (nlog++ < 5)
+                LOG("[audren] i3dl2 reverb: non-finite gains (rate %u hf %g/%g decay %g/%g room %g refl %g rev %g diff %g "
+                    "delays %g/%g density %g dry %g)\n", p->sample_rate, p->room_hf, p->hf_reference, p->decay_time,
+                    p->hf_decay_ratio, p->room_gain, p->reflections_gain, p->reverb_gain, p->diffusion, p->reflection_delay,
+                    p->reverb_delay_time, p->density, p->dry_gain);
+            break;
+        }
+    for (int i = 0; i < 20; i++) {
+        uint32_t n = (uint32_t)roundf(sr * (p->reflection_delay * 1000.0f + r3_early_times[i] * 1000.0f * (p->reverb_delay_time * 0.9998f + 0.02f)));
+        r->early_time[i] = n < r->pre.max ? n : r->pre.max;
+    }
+}
+
+static void reverb3d_init(Reverb3d *r) {
+    uint32_t sr = r->p.sample_rate / 1000;
+    if (!sr || sr > 192) sr = 48;
+    for (int i = 0; i < 4; i++) {
+        d3_init(&r->fdn[i], sr, r3_fdn_max[i]);
+        d3_init(&r->decay1[i].dl, sr, r3_decay1[i]);
+        d3_init(&r->decay2[i].dl, sr, r3_decay2[i]);
+    }
+    d3_init(&r->pre, sr, 400);
+    d3_init(&r->fc, sr, 5);
+    reverb3d_update(r);
+    r->ready = 1;
+}
+
+static void reverb3d_process(Reverb3d *r, float *const *in, float *const *out, uint32_t n) {
+    static const int8_t oe1[20] = {0}, oe2[20] = {0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1};
+    static const int8_t oe4[20] = {0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 3, 3, 3};
+    static const int8_t oe6[40] = {4, 5, 0, 5, 0, 5, 1, 5, 1, 5, 1, 5, 1, 5, 2, 5, 2, 5, 2, 5, 1, 5, 1, 5, 1, 5, 0, 5, 0, 5, 0, 5, 0, 5, 3, 5, 3, 5, 3, 5};
+    static const int8_t te6[40] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19};
+    static const int8_t tf1[1] = {0}, tf2[2] = {0, 1}, tf4[4] = {0, 1, 2, 3}, tf6[6] = {0, 1, 2, 3, -1, 3};
+    int ch = r->p.ch, ne = ch == 6 ? 40 : 20, nf = ch;
+    const int8_t *oe = ch == 1 ? oe1 : ch == 2 ? oe2 : ch == 4 ? oe4 : oe6, *tf = ch == 1 ? tf1 : ch == 2 ? tf2 : ch == 4 ? tf4 : tf6;
+    if (ch != 1 && ch != 2 && ch != 4 && ch != 6) return;
+    for (uint32_t s = 0; s < n; s++) {
+        float ov[6] = {0}, cin[6], fo[4], fb[4], v[4];
+        float tap = d3_tap(&r->pre, r->reflection_time, 1);
+        for (int i = 0; i < ne; i++) {
+            int e = ch == 6 ? te6[i] : i;  // (the early delay line; its output channel from the table at that index)
+            ov[oe[e]] += d3_tap(&r->pre, r->early_time[e], 1) * r3_early_gain[e];
+        }
+        float target = 0;
+        for (int c = 0; c < ch; c++) { cin[c] = in[c][s]; target += cin[c]; }
+        for (int c = 0; c < ch; c++) ov[c] *= r->early_gain;
+        r->prev_pre = target * r->target_pre_gain + r->prev_pre * r->prev_pre_gain;
+        d3_update(&r->pre, r->prev_pre);
+        for (int i = 0; i < 4; i++) {
+            float f = d3_read(&r->fdn[i]);
+            fo[i] = f * r->direct[i] + r->prev_fb[i];
+            r->prev_fb[i] = f * r->current[i] + fo[i] * r->out[i];
+        }
+        fb[0] = fo[2] + fo[1];
+        fb[1] = -fo[0] - fo[3];
+        fb[2] = fo[0] - fo[3];
+        fb[3] = fo[1] - fo[2];
+        for (int i = 0; i < 4; i++) {
+            v[i] = dd3_update(&r->decay2[i], dd3_update(&r->decay1[i], tap * r->late_gain + fb[i]));
+            d3_update(&r->fdn[i], v[i]);
+        }
+        for (int c = 0; c < nf; c++)
+            if (tf[c] >= 0) out[c][s] = ov[c] + v[tf[c]] + cin[c] * r->dry;
+        if (ch == 1) out[0][s] += v[1];
+        if (ch == 6) out[4][s] += ov[4] + d3_update(&r->fc, (v[2] - v[3]) * 0.5f) + cin[4] * r->dry;
+        if (!isfinite(v[0] + v[1] + v[2] + v[3] + r->prev_pre)) {  // (unstable parameters: start over silent, not NaN for good)
+            static int nlog;
+            if (nlog++ < 5) LOG("[audren] i3dl2 reverb: non-finite state at sample %u: reset\n", s);
+            reverb3d_init(r);
+            for (int c = 0; c < ch; c++) out[c][s] = cin[c] * r->dry;
+        }
+    }
+}
+
+// ------------------------------------------------------------------ delay (port of Ryujinx DelayState / Command)
+typedef struct {
+    uint8_t input[6], output[6];
+    uint16_t ch_max, ch;
+    uint32_t delay_time_max, delay_time, sample_rate, in_gain, feedback_gain, out_gain, dry_gain, channel_spread, low_pass;
+} DelayParam;  // (0x34 bytes, then a status byte)
+
+typedef struct {
+    int ready;
+    uint8_t raw[0x34];
+    DelayParam p;
+    DelayLine dl[6];
+    float lpz[6], feedback, base, cross, lp_fb, lp_base;
+} Delay;
+
+static void delay_update(Delay *d) {
+    d->feedback = q14((int32_t)d->p.feedback_gain) * 0.98f;
+    float spread = q14((int32_t)d->p.channel_spread);
+    d->base = (1.0f - spread) * d->feedback;
+    d->cross = spread * (d->p.ch == 4 || d->p.ch == 6 ? 0.5f : 1.0f) * d->feedback;
+    d->lp_fb = 0.95f * q14((int32_t)d->p.low_pass);
+    d->lp_base = 1.0f - d->lp_fb;
+}
+static void delay_init(Delay *d) {
+    uint32_t sr = (uint32_t)(d->p.sample_rate >> 14) / 1000;
+    if (!sr || sr > 192) sr = 48;
+    for (int c = 0; c < d->p.ch && c < 6; c++) {
+        dl_init(&d->dl[c], sr, (float)d->p.delay_time_max);
+        dl_set(&d->dl[c], (float)d->p.delay_time);
+        d->lpz[c] = 0;
+    }
+    delay_update(d);
+    d->ready = 1;
+}
+static void delay_process(Delay *d, float *const *in, float *const *out, uint32_t n) {
+    int ch = d->p.ch;
+    float b = d->base, x = d->cross, fbk = q14((int32_t)d->p.feedback_gain);
+    float m[6][6] = {{0}};  // the feedback matrix (rows: the delay line fed)
+    if (ch == 1) m[0][0] = fbk;
+    else if (ch == 2) { m[0][0] = m[1][1] = b; m[0][1] = m[1][0] = x; }
+    else if (ch == 4) {
+        static const int8_t k[4][4] = {{1, 2, 2, 0}, {2, 1, 0, 2}, {2, 0, 1, 2}, {0, 2, 2, 1}};
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) m[i][j] = k[i][j] == 1 ? b : k[i][j] == 2 ? x : 0;
+    } else if (ch == 6) {
+        static const int8_t k[6][6] = {{1, 0, 2, 0, 2, 0}, {0, 1, 2, 0, 0, 2}, {2, 2, 1, 0, 0, 0}, {0, 0, 0, 3, 0, 0},
+                                       {2, 0, 0, 0, 1, 2}, {0, 2, 0, 0, 2, 1}};
+        for (int i = 0; i < 6; i++) for (int j = 0; j < 6; j++) m[i][j] = k[i][j] == 1 ? b : k[i][j] == 2 ? x : k[i][j] == 3 ? fbk : 0;
+    } else return;
+    float in_gain = q14((int32_t)d->p.in_gain), dry = q14((int32_t)d->p.dry_gain), outg = q14((int32_t)d->p.out_gain);
+    for (uint32_t s = 0; s < n; s++) {
+        float cin[6], dv[6], t[6];
+        for (int c = 0; c < ch; c++) { cin[c] = in[c][s] * 64; dv[c] = dl_read(&d->dl[c]); }
+        for (int i = 0; i < ch; i++) {
+            t[i] = cin[i] * in_gain;
+            for (int j = 0; j < ch; j++) t[i] += dv[j] * m[j][i];  // (Transform: the vector times the matrix)
+        }
+        for (int c = 0; c < ch; c++) {
+            d->lpz[c] = d->lp_fb * d->lpz[c] + t[c] * d->lp_base;
+            dl_update(&d->dl[c], d->lpz[c]);
+            out[c][s] = (cin[c] * dry + dv[c] * outg) / 64;
+        }
+    }
+}
+
+// ------------------------------------------------------------------ biquad filter (Ryujinx BiquadFilterHelper)
+typedef struct {
+    uint8_t input[6], output[6];
+    int16_t num[3], den[2];
+    uint8_t ch, status;
+} BiquadParam;
+typedef struct { int ready; BiquadParam p; float s0[6], s1[6]; } Biquad;
+static void biquad_process(Biquad *q, int c, const float *in, float *out, uint32_t n) {
+    float a0 = q->p.num[0] / 16384.0f, a1 = q->p.num[1] / 16384.0f, a2 = q->p.num[2] / 16384.0f;
+    float b1 = q->p.den[0] / 16384.0f, b2 = q->p.den[1] / 16384.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        float x = in[i], y = x * a0 + q->s0[c];
+        q->s0[c] = x * a1 + y * b1 + q->s1[c];
+        q->s1[c] = x * a2 + y * b2;
+        out[i] = y;
+    }
+}
+
+// Aux (2): the game's own processing (AuxiliaryBufferParameter). The mix's samples go out, as int32, to the send
+// buffer's ring; what the game wrote to the return buffer's ring comes back as the output. Each buffer starts with two
+// 0x40-byte infos {read offset, write offset, lost, total} (the game's, then ours) and its ring of buffer_size samples
+// follows them. Channel c of a mix update is at offset + c * N; the offset moves by channels * N after the last one.
+typedef struct {
+    uint8_t input[24], output[24];
+    uint32_t ch, sample_rate, buffer_size, ch_max;
+    uint64_t send_info, send_storage, return_info, return_storage;
+    uint32_t mix_sample_size, total_samples, mix_sample_count;
+} AuxParam;
+typedef struct { AuxParam p; uint8_t ready; } Aux;
+
 struct Effect {
     uint8_t type, enabled;
     int32_t mix_id;
     uint32_t order;
     Reverb rv;
+    Reverb3d r3;
+    Delay dly;
+    Biquad bq;
+    Aux aux;
 };
 
 // Effect slot update from EffectInParameterVersion1 (0xC0 bytes: type, is_new, enabled, mix, buffers, order, data).
+static bool channels_ok(uint16_t c) { return c == 1 || c == 2 || c == 4 || c == 6; }
 static void effect_update(Effect *fx, const uint8_t *e) {
-    if (fx->type != e[0]) memset(&fx->rv.p, 0, sizeof fx->rv.p), fx->rv.ready = 0;
+    if (fx->type != e[0]) {
+        memset(&fx->rv.p, 0, sizeof fx->rv.p), fx->rv.ready = 0;
+        fx->r3.ready = fx->dly.ready = fx->bq.ready = fx->aux.ready = 0;
+    }
     fx->type = e[0];
     fx->enabled = e[2];
     memcpy(&fx->mix_id, e + 4, 4);
     memcpy(&fx->order, e + 0x18, 4);
-    if (fx->type != 4) return;
     const uint8_t *d = e + 0x20;
+    if (fx->type == 5) {  // I3DL2 reverb
+        Reverb3dParam p;
+        memcpy(&p, d, sizeof p);
+        if (!channels_ok(p.ch) || !channels_ok(p.ch_max) || p.decay_time <= 0 || p.hf_decay_ratio <= 0) return;
+        if (e[1] || !fx->r3.ready) { memcpy(fx->r3.raw, d, sizeof fx->r3.raw), fx->r3.p = p; reverb3d_init(&fx->r3); }
+        else if (memcmp(fx->r3.raw, d, sizeof fx->r3.raw)) { memcpy(fx->r3.raw, d, sizeof fx->r3.raw), fx->r3.p = p; reverb3d_update(&fx->r3); }
+        return;
+    }
+    if (fx->type == 3) {  // delay
+        DelayParam p;
+        memcpy(&p, d, sizeof p);
+        if (!channels_ok(p.ch) || !channels_ok(p.ch_max)) return;
+        if (e[1] || !fx->dly.ready || p.ch != fx->dly.p.ch || p.delay_time_max != fx->dly.p.delay_time_max) {
+            memcpy(fx->dly.raw, d, sizeof fx->dly.raw), fx->dly.p = p;
+            delay_init(&fx->dly);
+        } else if (memcmp(fx->dly.raw, d, sizeof fx->dly.raw)) {
+            memcpy(fx->dly.raw, d, sizeof fx->dly.raw), fx->dly.p = p;
+            for (int c = 0; c < p.ch; c++) dl_set(&fx->dly.dl[c], (float)p.delay_time);
+            delay_update(&fx->dly);
+        }
+        return;
+    }
+    if (fx->type == 2) {  // aux
+        AuxParam p;
+        memcpy(&p, d, sizeof p);
+        bool ok = p.ch >= 1 && p.ch <= 6 && p.buffer_size && p.send_info && p.return_info;
+        for (uint64_t a = 0, k = 0; ok && k < 2; k++) {  // (both rings inside guest memory)
+            a = k ? p.return_info : p.send_info;
+            ok = a >= GUEST_LO && a + 0x80 + 4ull * p.buffer_size <= GUEST_HI;
+        }
+        fx->aux.ready = ok;
+        if (ok) fx->aux.p = p;
+        return;
+    }
+    if (fx->type == 6) {  // biquad filter
+        BiquadParam p;
+        memcpy(&p, d, sizeof p);
+        if (p.ch < 1 || p.ch > 6) return;
+        if (e[1] || !fx->bq.ready) memset(fx->bq.s0, 0, sizeof fx->bq.s0), memset(fx->bq.s1, 0, sizeof fx->bq.s1);
+        fx->bq.p = p;
+        fx->bq.ready = 1;
+        return;
+    }
+    if (fx->type != 4) return;
     uint16_t ch_max, ch;
     memcpy(&ch_max, d + 12, 2);
     memcpy(&ch, d + 14, 2);
@@ -447,11 +766,71 @@ static void effect_update(Effect *fx, const uint8_t *e) {
     }
 }
 
+static void aux_ring(uint64_t ring, uint32_t size, uint32_t at, int32_t *samples, uint32_t n, bool write) {
+    int32_t *base = (int32_t *)(uintptr_t)ring;
+    for (uint32_t i = 0; i < n; i++, at = at + 1 == size ? 0 : at + 1)
+        if (write) base[at] = samples[i]; else samples[i] = base[at];
+}
+
+static void aux_process(Aux *a, bool enabled, float **in, float **out, uint32_t N) {
+    const AuxParam *p = &a->p;
+    volatile uint32_t *send = (volatile uint32_t *)(uintptr_t)(p->send_info + 0x40);  // (our infos: the second ones)
+    volatile uint32_t *ret = (volatile uint32_t *)(uintptr_t)(p->return_info + 0x40);
+    if (!enabled) {
+        send[0] = send[1] = send[3] = 0;
+        ret[0] = ret[1] = ret[3] = 0;
+        for (uint32_t c = 0; c < p->ch; c++) if (in[c] != out[c]) memcpy(out[c], in[c], N * sizeof(float));
+        return;
+    }
+    uint32_t size = p->buffer_size, w = send[1], r = ret[0];
+    int32_t tmp[1024];
+    if (N > 1024) return;
+    for (uint32_t c = 0; c < p->ch; c++) {
+        for (uint32_t i = 0; i < N; i++) tmp[i] = (int32_t)in[c][i];
+        if (w + c * N <= size) aux_ring(p->send_info + 0x80, size, (w + c * N) % size, tmp, N, true);
+        if (r + c * N <= size) {
+            aux_ring(p->return_info + 0x80, size, (r + c * N) % size, tmp, N, false);
+            for (uint32_t i = 0; i < N; i++) out[c][i] = (float)tmp[i];
+        } else memset(out[c], 0, N * sizeof(float));
+    }
+    send[1] = (w + p->ch * N) % size;
+    ret[0] = (r + p->ch * N) % size;
+}
+
+// The other effect types (as the reverb below: in place over the mix's buffers, by order; disabled ones copy input to
+// output).
+static void apply_other_effect(Renderer *r, Effect *fx, Mix *m, uint32_t N) {
+    const uint8_t *ins, *outs;
+    int ch;
+    if (fx->type == 5 && fx->r3.ready) ins = fx->r3.p.input, outs = fx->r3.p.output, ch = fx->r3.p.ch;
+    else if (fx->type == 3 && fx->dly.ready) ins = fx->dly.p.input, outs = fx->dly.p.output, ch = fx->dly.p.ch;
+    else if (fx->type == 6 && fx->bq.ready) ins = fx->bq.p.input, outs = fx->bq.p.output, ch = fx->bq.p.ch;
+    else if (fx->type == 2 && fx->aux.ready) ins = fx->aux.p.input, outs = fx->aux.p.output, ch = (int)fx->aux.p.ch;
+    else return;
+    float *in[6], *out[6];
+    for (int c = 0; c < ch; c++) {
+        if (ins[c] >= m->bufs || outs[c] >= m->bufs) return;
+        in[c] = m->buf + (ins[c] % MIXBUF_MAX) * N;
+        out[c] = m->buf + (outs[c] % MIXBUF_MAX) * N;
+    }
+    if (fx->type == 2) { aux_process(&fx->aux, fx->enabled, in, out, N); return; }  // (the game's: not a room effect)
+    bool off = !fx->enabled || (fx->type != 6 && !g_settings.reverb);  // (the reverb setting: room effects)
+    if (off) {
+        for (int c = 0; c < ch; c++) if (in[c] != out[c]) memcpy(out[c], in[c], N * sizeof(float));
+        return;
+    }
+    if (fx->type == 5) reverb3d_process(&fx->r3, in, out, N);
+    else if (fx->type == 3) delay_process(&fx->dly, in, out, N);
+    else for (int c = 0; c < ch; c++) biquad_process(&fx->bq, c, in[c], out[c], N);
+    (void)r;
+}
+
 static void apply_effects(Renderer *r, int32_t mix_id, Mix *m) {
     uint32_t N = r->sample_count;
     for (uint32_t order = 0; order < r->effects; order++) {
         for (uint32_t i = 0; i < r->effects; i++) {
             Effect *fx = &r->fx[i];
+            if (fx->mix_id == mix_id && fx->order == order && fx->type != 4) { apply_other_effect(r, fx, m, N); continue; }
             if (fx->type != 4 || fx->mix_id != mix_id || fx->order != order || !fx->rv.ready) continue;
             int ch = fx->rv.p.ch;
             float *in[6], *out[6];
@@ -873,7 +1252,7 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
         static uint32_t seen_types;
         if (e[0] && e[0] < 32 && !(seen_types & (1u << e[0]))) {
             seen_types |= 1u << e[0];
-            LOG("[audren] effect type %u used%s: slot %u mix %d enabled %u\n", e[0], e[0] == 4 ? "" : " (not implemented)", i,
+            LOG("[audren] effect type %u used%s: slot %u mix %d enabled %u\n", e[0], e[0] >= 2 && e[0] <= 6 ? "" : " (not implemented)", i,
                 *(const int32_t *)(e + 4), e[2]);
         }
         if (e[0] && getenv("LARECOMP_AUDIO_LOG")) {

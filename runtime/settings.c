@@ -167,6 +167,8 @@ void settings_load(void) {
             if (!g_settings.upscaler_auto) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;
             else g_settings.upscaler = g_default_upscaler;
         }
+        else if (!strcmp(key, "frame_generation")) g_settings.frame_gen = !strcmp(val, "off") ? 0 : atoi(val) >= 120 ? 120 : atoi(val) >= 60 ? 60 : 0;
+        else if (!strcmp(key, "frame_generation_method")) g_settings.frame_gen_flow = !strcmp(val, "flow");
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
@@ -230,6 +232,8 @@ void settings_save(void) {
     fprintf(f, "upscaler = %s\n", g_settings.upscaler_auto ? "auto" : g_settings.upscaler == UPSCALE_METALFX ? "metalfx" :
                                    g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    fprintf(f, "frame_generation = %s\n", g_settings.frame_gen == 120 ? "120" : g_settings.frame_gen == 60 ? "60" : "off");
+    fprintf(f, "frame_generation_method = %s\n", g_settings.frame_gen_flow ? "flow" : "metalfx");
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);

@@ -45,7 +45,7 @@ profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#
   where you can walk around and play, at 120 fps.
 - **Game updates** are applied when extracting (`--update`): the update's code and its romfs patch over the base
   game's.
-- Not done: an in-game menu, the I3DL2 reverb audio effect, online features, Linux and Windows (the Vulkan backend
+- Not done: an in-game menu, online features, Linux and Windows (the Vulkan backend
   from LASRecomp is there but has not been built).
 
 See [PLAN.md](PLAN.md) for the design, the full status and the known problems.
@@ -90,8 +90,27 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
    ./build/nx data/acnh
    ```
 
-   The app picks the game library built for those game files. Saves go to `save/<game>/`, settings to `nx.ini`,
-   shader caches to `cache/<game>/`, all in the repository folder.
+   The app picks the game library built for those game files. Saves go to `save/<game>/` (photos taken in a game,
+   such as Animal Crossing's camera app, to `save/<game>/album/`), settings to `nx.ini`, shader caches to
+   `cache/<game>/`, all in the repository folder.
+
+## Settings
+
+`nx.ini` (written on first launch, in the repository folder) holds the options; there is no in-game menu yet.
+
+- `frame_generation = off | 60 | 120`: for a game that runs at 30 fps (Animal Crossing), images are generated between
+  its frames from the motion between them, so the window shows 60 or 120 a second (at most the display's refresh
+  rate). The game itself still runs at 30, so its speed stays right. It costs about one display frame of latency. No
+  effect on a game already presenting at that rate (Metroid Dread).
+- `frame_generation_method = metalfx | flow`: how. `metalfx` (default, macOS 26 or later): at 60, Apple's MetalFX frame
+  interpolation, fed with the game's depth and with motion vectors nx draws for it (each object's vertex shader runs
+  again with the previous frame's data) and the HUD apart, so it stays still; the cleanest images, and lighter on the
+  GPU than `flow`; drawing the motion vectors costs the game about 5% of its frame rate. `flow`, and 120 in any case: images from the optical flow between the frames; fast-moving details
+  (legs while running) can ghost a little.
+- `resolution`: the internal rendering resolution. `match` (default) follows the window's size; `1x` to `4x` render
+  at 1080, 2160 (4K), 3240 or 4320 lines whatever the window, scaled to fit it; `dynamic`, `75%`, `50%` and `25%`
+  lower it from `match` for slower GPUs. The game still lays out its screen for 1080p, so the HUD and text are
+  rendered sharper, not smaller.
 
 ## Controls
 
@@ -138,6 +157,11 @@ hitch on a first visit. To avoid that:
   [ZacharyACoon/MetroidDreadSaveFiles](https://github.com/ZacharyACoon/MetroidDreadSaveFiles)) from a scratch copy of
   its save, continues it, explores for a few minutes (`EXPLORE=<seconds>`) and captures frames to `build/cp/<NNN>/`;
   `GAME_DIR=data/dread-2.1.0` runs another version.
+- `tools/acnh_saves.sh <dir> [jobs]` (Animal Crossing): boots each save folder (`main.dat`, `mainHeader.dat`,
+  `Villager*/`: a save dump, or a copy of `save/acnh/save_0`) from a scratch copy, in the day and at night, walks the
+  island, opens the phone and the pockets, and captures frames to `build/acnh_cp/<save>-{day,night}/`. A resident
+  belongs to the Switch account that made it: the runner plays as that account (`LARECOMP_USER_ID`, which
+  `tools/acnh_save.py <save dir>` prints), so the game doesn't start a new resident instead.
 - `LARECOMP_INPUT="frame:BUTTON:frames,..."` scripts the controller, `LARECOMP_SHOT_AT=frame,...` saves screenshots;
   `LARECOMP_RECORD=<file>` records your inputs while you play and `LARECOMP_REPLAY=<file>` plays them back.
   `LARECOMP_TIME_OFFSET=<seconds>` shifts the clock the game sees (Animal Crossing's time of day).

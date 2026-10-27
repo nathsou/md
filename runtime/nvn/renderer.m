@@ -19,8 +19,10 @@
 #include "game.h"
 #include "recolour.h"
 #include "slowframe.h"
+#include "motion.h"
 
 static id<MTLDevice> dev;
+id<MTLDevice> renderer_device(void) { return dev; }
 static id<MTLCommandBuffer> cmdbuf;
 static id<MTLRenderCommandEncoder> enc;
 static id<MTLRenderPipelineState> clear_pipes[64];
@@ -31,6 +33,7 @@ static uint64_t stat_clears_as_load, stat_clear_passes;  // (deferred clears)
 #define SKIPPED() (stat_skipped++, g_debug_frame ? (void)LOG("[draw] skipped (renderer.m:%d)\n", __LINE__) : (void)0)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_vcopy, stat_vcopy_bytes;  // vertex / index ranges copied at translation (dyn_copy)
+static uint64_t stat_ring_bytes, stat_ring_new, stat_ring_reused;  // uniform data copied to the ring; rings made; bytes not copied again
 static double stat_gpu_s;
 // GPU busy time (dynamic resolution: output_scale.c; the "gpu" of the [metal] stats line), ns so far: the game's
 // command buffers, the window image's (metal.m backend_present), and the plain sum of their spans (diagnostics)
@@ -125,10 +128,12 @@ const char *renderer_stats(void) {
     extern uint64_t g_tex_live_bytes;
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
+    uint64_t mvd, mvm, mvb;
+    mv_stats(&mvd, &mvm, &mvb);
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu vcopy %llu/%.0fKB ring %.0f MB (%llu new, %.0f MB reused) mv %llu/%llu %.1f MB mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | deferred: clears as load %llu, clear passes %llu | counters gpu %llu | pace %s, %llu frames over", stat_draws, stat_skipped,
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
-             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
+             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), (unsigned long long)stat_vcopy, stat_vcopy_bytes / 1024.0, stat_ring_bytes / 1048576.0, (unsigned long long)stat_ring_new, stat_ring_reused / 1048576.0, (unsigned long long)mvm, (unsigned long long)mvd, mvb / 1048576.0, foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], (unsigned long long)stat_clears_as_load, (unsigned long long)stat_clear_passes,
              (unsigned long long)stat_counters_gpu, pace_is_slow() ? "30" : "60", (unsigned long long)pace_frames_over());
     stat_counters_gpu = 0;
     stat_compiles = 0;
@@ -136,6 +141,7 @@ const char *renderer_stats(void) {
     stat_compile_ms = 0;
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     stat_vcopy = stat_vcopy_bytes = 0;
+    stat_ring_bytes = stat_ring_new = stat_ring_reused = 0;
     memset(stat_wait_by, 0, sizeof stat_wait_by); memset(stat_wait_n, 0, sizeof stat_wait_n);
     stat_gpu_s = 0;
     stat_clears_as_load = stat_clear_passes = 0;
@@ -240,6 +246,22 @@ static TexDefer *td_get(NvnTexture *t, bool create) {
         }
     }
     return NULL;
+}
+
+// Linear render targets (NVN_TEX_LINEAR) drawn or copied into: the CPU reads what the GPU drew there (Animal
+// Crossing's camera renders its photo into one and hands that memory to the album). Each is copied back to guest
+// memory at the next fence in the list or at the list's end (linear_drawn_write_back).
+#define LINEAR_DRAWN_MAX 16
+static NvnTexture *linear_drawn[LINEAR_DRAWN_MAX];
+static int nlinear_drawn;
+static void linear_drawn_note(NvnTexture *t) {
+    if (!t || !(t->flags & 0x40) || t->target != 1 || t->addr < HEAP_BASE) return;
+    for (int i = 0; i < nlinear_drawn; i++) if (linear_drawn[i] == t) return;
+    if (nlinear_drawn < LINEAR_DRAWN_MAX) linear_drawn[nlinear_drawn++] = t;
+}
+static void linear_drawn_forget(NvnTexture *t) {
+    for (int i = 0; i < nlinear_drawn; i++)
+        if (linear_drawn[i] == t) { linear_drawn[i] = linear_drawn[--nlinear_drawn]; return; }
 }
 
 static void td_forget(NvnTexture *t) {  // (the texture is gone: drain_gone)
@@ -475,6 +497,7 @@ static void drain_gone(void) {
         if (local[i].mtl) views_forget(local[i].mtl);
         if (local[i].nvn) {
             td_forget(local[i].nvn);
+            linear_drawn_forget(local[i].nvn);
             if (g_snap_copies) [g_snap_copies removeObjectForKey:[NSValue valueWithPointer:local[i].nvn]];
             for (int k = 0; k < 8; k++) if (snap_tex[k] == local[i].nvn) { snap_tex[k] = NULL; snap_ok[k] = false; }
         }
@@ -796,6 +819,133 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
 // ------------------------------------------------------------------ render passes
 static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
+// Motion vectors (motion.h): passes drawing with the scene's depth buffer get the motion target as colour attachment
+// MV_TARGET, cleared by the frame's first of them.
+uint64_t renderer_exec_frame(void);
+static bool pass_mv;           // the open pass has the motion target
+static NvnTexture *mv_depth;   // the scene's depth buffer: the frame before's with the most depth-writing draws x pixels
+static id<MTLTexture> mv_tex;  // the motion target (the depth buffer's size)
+static id<MTLTexture> mv_depth_tex;  // (its Metal texture in the last motion pass)
+static uint64_t mv_clear_frame = ~0ull;
+
+static void mv_count(NvnTexture *d) {  // (a depth-writing draw into d)
+    static struct { NvnTexture *t; uint32_t n; } c[8];
+    static uint64_t frame = ~0ull;
+    uint64_t f = renderer_exec_frame();
+    if (f != frame) {
+        int best = -1;
+        for (int i = 0; i < 8; i++)  // (by draws times pixels: Animal Crossing's minimap has more draws than its view)
+            if (c[i].t && (best < 0 || (double)c[i].n * c[i].t->width * c[i].t->height > (double)c[best].n * c[best].t->width * c[best].t->height))
+                best = i;
+        NvnTexture *nd = best >= 0 ? c[best].t : NULL;
+        if (nd != mv_depth) LOG("[mv] scene depth %p (%ux%u, %u draws)\n", (void *)nd, nd ? nd->width : 0, nd ? nd->height : 0, best >= 0 ? c[best].n : 0);
+        mv_depth = nd;
+        memset(c, 0, sizeof c);
+        frame = f;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (c[i].t == d) { c[i].n++; return; }
+        if (!c[i].t) { c[i].t = d; c[i].n = 1; return; }
+    }
+}
+
+static bool mv_attach(MTLRenderPassDescriptor *rp) {
+    if (!mv_enabled() || !mv_depth || st.rt.depth != mv_depth || !st.rt.ncolor || st.rt.ncolor > MV_TARGET) return false;
+    id<MTLTexture> d = rp.depthAttachment.texture ?: rp.stencilAttachment.texture;
+    if (!d || d.sampleCount > 1 || d.textureType != MTLTextureType2D) return false;
+    for (int i = 0; i < st.rt.ncolor; i++) {
+        id<MTLTexture> c = rp.colorAttachments[i].texture;
+        if (c && (c.sampleCount > 1 || c.width != d.width || c.height != d.height)) return false;
+    }
+    if (!mv_tex || mv_tex.width != d.width || mv_tex.height != d.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MV_FORMAT width:d.width height:d.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        mv_tex = [dev newTextureWithDescriptor:td];
+        mv_tex.label = @"motion";
+        LOG("[mv] motion target %lux%lu\n", (unsigned long)d.width, (unsigned long)d.height);
+    }
+    uint64_t f = renderer_exec_frame();
+    MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[MV_TARGET];
+    a.texture = mv_tex;
+    a.loadAction = f == mv_clear_frame ? MTLLoadActionLoad : MTLLoadActionClear;
+    a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    a.storeAction = MTLStoreActionStore;
+    mv_clear_frame = f;
+    mv_depth_tex = d;
+    return true;
+}
+
+// The UI layer (motion.h mv_fs_ui_msl): the HUD drawn over the scene, apart, so that MetalFX keeps it still. It belongs
+// to one screen-sized image at a time (ui_owner): a full-screen opaque draw into a screen-sized image without depth
+// (the scene's composite) takes it, cleared - or as it is when the draw reads the owner (a copy: the window image's);
+// the blended draws into the owner after that (the HUD) go to the layer too, their alpha as coverage. Passes into
+// screen-sized images without depth have it as attachment MV_TARGET.
+static bool pass_ui;
+static id<MTLTexture> ui_tex;
+static NvnTexture *ui_owner;
+static bool ui_clear;  // (the layer is to start empty: cleared by the owner's next pass with it - or there's no HUD)
+// The owner as the composite left it, before the HUD (copied at the owner's first pass with the layer), and the image
+// the HUD then went into: where the two differ is HUD too - its parts that leave alpha alone (the clock's shadow)
+static id<MTLTexture> ui_scene, ui_hud;
+static bool ui_scene_ok;
+
+static bool ui_attach(MTLRenderPassDescriptor *rp) {
+    extern NvnTexture *renderer_presented_texture(void);
+    NvnTexture *scr = renderer_presented_texture(), *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!mv_enabled() || !scr || !t0 || st.rt.depth || st.rt.ncolor > MV_TARGET || t0->width != scr->width || t0->height != scr->height)
+        return false;
+    id<MTLTexture> c = rp.colorAttachments[0].texture;
+    if (!c || c.sampleCount > 1 || c.textureType != MTLTextureType2D) return false;
+    if (!ui_tex || ui_tex.width != c.width || ui_tex.height != c.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:UI_FORMAT width:c.width height:c.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        ui_tex = [dev newTextureWithDescriptor:td];
+        ui_tex.label = @"ui layer";
+        ui_owner = NULL;
+        LOG("[mv] UI layer %lux%lu\n", (unsigned long)c.width, (unsigned long)c.height);
+    }
+    if (ui_clear && t0 == ui_owner) {  // (the HUD's first pass: the image without it)
+        if (!ui_scene || ui_scene.width != c.width || ui_scene.height != c.height || ui_scene.pixelFormat != c.pixelFormat) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:c.pixelFormat width:c.width height:c.height mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            ui_scene = [dev newTextureWithDescriptor:td];
+        }
+        id<MTLBlitCommandEncoder> bl = [cb() blitCommandEncoder];
+        [bl copyFromTexture:c toTexture:ui_scene];
+        [bl endEncoding];
+        ui_hud = c;
+        ui_scene_ok = true;
+    }
+    MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[MV_TARGET];
+    a.texture = ui_tex;
+    a.loadAction = ui_clear && t0 == ui_owner ? MTLLoadActionClear : MTLLoadActionLoad;
+    a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    a.storeAction = MTLStoreActionStore;
+    if (t0 == ui_owner) ui_clear = false;
+    return true;
+}
+
+// (the HUD's coverage in alpha - its colours are the shown image's: Animal Crossing draws it into a 10-bit image with
+// two bits of alpha, and changes the colours in the copy to the window image. scene / hud: the image without and with
+// the HUD, nil when not known)
+id<MTLTexture> renderer_ui_layer(NvnTexture *presented, id<MTLTexture> *scene, id<MTLTexture> *hud) {
+    if (!presented || presented != ui_owner || ui_clear) return nil;
+    bool ok = ui_scene_ok && ui_hud && ui_hud.width == ui_scene.width && ui_hud.height == ui_scene.height;
+    *scene = ok ? ui_scene : nil;
+    *hud = ok ? ui_hud : nil;
+    return ui_tex;
+}
+
+// The frame's motion and depth (the frame being presented: translated up to its present), nil without any
+id<MTLTexture> renderer_motion(id<MTLTexture> *depth) {
+    if (!mv_tex || mv_clear_frame != renderer_exec_frame()) return nil;
+    *depth = mv_depth_tex;
+    return mv_tex;
+}
+
 static void begin_pass(void) {
     if (enc && !st.rt_dirty) return;
     opening_pass = true;  // (the chunk submit's end_pass below must not flush anything into this pass)
@@ -805,6 +955,27 @@ static void begin_pass(void) {
     pass_depth = st.rt.depth;
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     int w = 0, h = 0;
+    {   // attachments of one guest size, some scaled and some not: all scaled (metal.m renderer_texture_promote_scalable)
+        extern bool renderer_texture_promote_scalable(NvnTexture *t);
+        NvnTexture *at[9];
+        int n = 0;
+        bool scaled = false;
+        for (int i = -1; i < st.rt.ncolor && n < 9; i++) {
+            NvnTexture *t = i < 0 ? st.rt.depth : st.rt.color[i];
+            if (!t) continue;
+            float sx, sy;
+            renderer_texture_scale(t, &sx, &sy);
+            if (sx != 1 || sy != 1) scaled = true;
+            at[n++] = t;
+        }
+        for (int i = 0; scaled && i < n; i++)
+            for (int k = 0; k < n; k++)
+                if (k != i && at[k]->width == at[i]->width && at[k]->height == at[i]->height) {
+                    float sx, sy;
+                    renderer_texture_scale(at[k], &sx, &sy);
+                    if (sx != 1 || sy != 1) { renderer_texture_promote_scalable(at[i]); break; }
+                }
+    }
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         if (!t) continue;
@@ -832,6 +1003,9 @@ static void begin_pass(void) {
             stat_clears_as_load++;
         }
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+        if (g_debug_frame)
+            LOG("[rt] color %d: %ux%u f%#x target %u flags %#x %s -> metal %lux%lu type %lu\n", i, t->width, t->height, t->format,
+                t->target, t->flags, t->label, (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.textureType);
         if (!w) renderer_texture_scale(t, &pass_sx, &pass_sy);
         w = (int)tex.width; h = (int)tex.height;
     }
@@ -857,6 +1031,8 @@ static void begin_pass(void) {
         if (e && e->clear_on) { e->clear_on = false; td_pending--; stat_clears_as_load++; }
         if (!w) { renderer_texture_scale(st.rt.depth, &pass_sx, &pass_sy); w = (int)tex.width; h = (int)tex.height; }
     }
+    pass_mv = mv_attach(rp);
+    pass_ui = !pass_mv && ui_attach(rp);
     pass_rt_w = pass_rt_h = 0;
     if (!w) {
         pass_sx = pass_sy = 1;
@@ -973,6 +1149,8 @@ static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
     }
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && st.rt.color[i]->samples > 1) pd.rasterSampleCount = st.rt.color[i]->samples;
+    if (pass_mv) pd.colorAttachments[MV_TARGET].pixelFormat = MV_FORMAT;
+    if (pass_ui) pd.colorAttachments[MV_TARGET].pixelFormat = UI_FORMAT;
 }
 
 // A full clear of texture t recorded for its next pass (an earlier one still recorded is replaced: it never ran).
@@ -1052,9 +1230,9 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         pd.colorAttachments[index].writeMask = m;
     }
     NSError *err;
-    NSString *key = [NSString stringWithFormat:@"clear %d %d %u %d %d %lu %lu %lu", index, kind, mask, depth, stencil,
+    NSString *key = [NSString stringWithFormat:@"clear %d %d %u %d %d %lu %lu %lu%s", index, kind, mask, depth, stencil,
                      (unsigned long)pd.colorAttachments[index < 0 ? 0 : index].pixelFormat,
-                     (unsigned long)pd.depthAttachmentPixelFormat, (unsigned long)pd.stencilAttachmentPixelFormat];
+                     (unsigned long)pd.depthAttachmentPixelFormat, (unsigned long)pd.stencilAttachmentPixelFormat, pass_mv ? " mv" : pass_ui ? " ui" : ""];
     id<MTLRenderPipelineState> pipe = cache[key];
     if (!pipe) {
         pipe = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&err]);
@@ -1119,6 +1297,13 @@ static int cbuf_base = 3, tex_base = 8;
     bool failed;
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
     ShaderFp fp[2];      // (stale-program detector, shader_prep.h; render thread only)
+    // motion vectors (motion.h): the variant's functions, its two extra vertex buffer slots; mv_state 0 not tried,
+    // 1 compiling, 2 ready, -1 none
+    id<MTLFunction> vs_mv, fs_mv;
+    _Atomic int mv_state;
+    id<MTLFunction> fs_ui[3];  // (the HUD's variant, by mode: blended, opaque, clear; ui_state as mv_state)
+    _Atomic int ui_state;
+    int mv_arena_slot, mv_off_slot;
 }
 @end
 @implementation Prog
@@ -1128,6 +1313,24 @@ static id<MTLBuffer> ring;
 static uint64_t ring_off;
 #define RING_SIZE (64u << 20)
 
+// Uniform snapshots a later draw can share (snap_reuse): their ring offset stays valid, and their source unchanged,
+// until snap_epoch moves - a new ring or a reset of this one, a command that may write guest memory anywhere, a new
+// list - or a command writes their range (snap_wrote: uniform updates and counter reports, thousands a frame).
+static uint32_t snap_epoch = 1;
+static uint32_t ring_gen;  // (new rings: motion.h's ids of snapshots)
+static struct { uint64_t lo, hi; } snap_wlog[64];  // (ranges written since the epoch began, in order)
+static uint32_t snap_nw;
+static void snap_invalidate(void) { snap_epoch++; snap_nw = 0; }
+static void snap_wrote(uint64_t addr, uint64_t size) {
+    if (snap_nw && addr <= snap_wlog[snap_nw - 1].hi && addr + size >= snap_wlog[snap_nw - 1].lo) {  // (next to the last: one)
+        if (addr < snap_wlog[snap_nw - 1].lo) snap_wlog[snap_nw - 1].lo = addr;
+        if (addr + size > snap_wlog[snap_nw - 1].hi) snap_wlog[snap_nw - 1].hi = addr + size;
+        return;
+    }
+    if (snap_nw == 64) { snap_invalidate(); return; }
+    snap_wlog[snap_nw].lo = addr, snap_wlog[snap_nw].hi = addr + size, snap_nw++;
+}
+
 static uint64_t ring_alloc(const void *data, uint64_t size) {
     if (!ring) ring = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared];
     uint64_t aligned = (ring_off + 255) & ~255ull;
@@ -1135,13 +1338,51 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
         // Start a fresh ring; command buffers in flight keep the old one alive until they complete.
         ring = [dev newBufferWithLength:(size > RING_SIZE ? size : RING_SIZE) options:MTLResourceStorageModeShared];
         aligned = 0;
+        snap_invalidate();
+        stat_ring_new++;
+        ring_gen++;
     }
     memcpy((uint8_t *)ring.contents + aligned, data, size);
     ring_off = aligned + size;
+    stat_ring_bytes += size;
     return aligned;
 }
 
-static void ring_reset(void) { ring_off = 0; }
+static void ring_reset(void) { ring_off = 0; snap_invalidate(); }
+
+// ring_alloc of guest memory, shared with an earlier draw's snapshot of the same range when nothing can have
+// written it since (the engine binds the same per-frame and per-view buffers - up to 64 KB, indexed ones whole -
+// to draw after draw: copying them again was a quarter of the render thread's time in Animal Crossing). CPU stores
+// from other threads while a list is translated race on the Switch too: the GPU reads them whenever it gets there.
+static uint64_t snap_reuse(uint64_t addr, uint64_t size) {
+    static struct { uint64_t addr, size, off; uint32_t epoch, nw; } tab[1024];
+    __typeof__(&tab[0]) e = &tab[((addr >> 4) ^ (addr >> 14) ^ size) & 1023];
+    if (e->epoch == snap_epoch && e->addr == addr && e->size == size) {
+        uint32_t i = e->nw;
+        while (i < snap_nw && (addr >= snap_wlog[i].hi || addr + size <= snap_wlog[i].lo)) i++;
+        if (i == snap_nw) {
+            // LARECOMP_SNAP_VERIFY=1: check each shared snapshot against the memory it stands for. (Animal Crossing:
+            // one 256-byte buffer differs now and then - the game's CPU rewriting it for its next frame while this one
+            // is translated; each draw copying it raced the same way)
+            static int verify = -1;
+            if (verify < 0) verify = getenv("LARECOMP_SNAP_VERIFY") != NULL;
+            if (verify) {
+                static uint64_t n, bad;
+                n++;
+                if (memcmp((uint8_t *)ring.contents + e->off, (void *)(uintptr_t)addr, size) && bad++ < 20)
+                    LOG("[snap] shared uniform snapshot %llx+%llu differs from memory (%llu of %llu)\n", (unsigned long long)addr,
+                        (unsigned long long)size, (unsigned long long)bad, (unsigned long long)n);
+                if (!(n & 0xFFFFF)) LOG("[snap] %llu shared uniform snapshots checked, %llu differed\n", (unsigned long long)n, (unsigned long long)bad);
+            }
+            e->nw = snap_nw;
+            stat_ring_reused += size;
+            return e->off;
+        }
+    }
+    uint64_t off = ring_alloc((void *)(uintptr_t)addr, size);
+    e->addr = addr, e->size = size, e->off = off, e->epoch = snap_epoch, e->nw = snap_nw;  // (after: a new ring moved the epoch)
+    return off;
+}
 
 // (debug) LARECOMP_LOG_BINDS=1: guest memory the GPU reads in place, per frame (bytes bound; distinct ranges once),
 // and the ranges of the previous frame whose contents the game rewrote by the time this frame is translated: with
@@ -1598,8 +1839,9 @@ static id<MTLComputePipelineState> archive_compute_pipeline(id<MTLFunction> f, N
 }
 
 // Draws whose output a later frame can't redo: the game renders some textures once (ACNH's colour grading 3D LUT,
-// eight slices drawn at boot), so skipping such a draw while its shaders compile would lose it for good. Draws into
-// 3D textures compile on the spot.
+// eight slices drawn at boot; its sky panorama, which the sea reflects: black water), so skipping such a draw while its
+// shaders compile would lose it for good. Draws into 3D textures, and into targets not drawn the frame before
+// (metal.m renderer_texture_drawn_lately), compile on the spot.
 static bool g_draw_must_run;
 static bool sync_shaders(void) {  // LARECOMP_SYNC_SHADERS: compile on first use, blocking (deterministic tests)
     static int v = -1;
@@ -1943,10 +2185,19 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        // (a cube array sampled as a cube - its first: ACNH's agl::env::CubeMap, which the sky panorama the sea reflects
+        // is made from; with the black dummy instead, the sea was dark navy)
+        else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureTypeCubeArray)
+            tex = view_cached(src, 0x6000000000000000ull | 4, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        else if (want == MTLTextureTypeCubeArray && tex.textureType == MTLTextureTypeCube)
+            tex = view_cached(src, 0x6000000000000000ull | 5, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCubeArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else {
             static int nlog;
-            if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
-                                 (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format, (unsigned long)tex.arrayLength);
+            if (nlog++ < 30)
+                LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu; program vs %llx fs %llx)\n",
+                    (unsigned long)want, (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format,
+                    (unsigned long)tex.arrayLength, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+                    st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
             return dummy_texture(want_type);
         }
     }
@@ -2177,12 +2428,16 @@ static void bind_textures(int stage, ShaderInfo *si) {
                         LOG("[dtex] linear texture stride %u -> %s\n", e->tex->stride, rp);
                     }
                 }
-                LOG("[dtex] slot %d tex %ux%u f%#x addr %llx size %llu nonzero %llu gpu_owned %d\n", i, e->tex->width,
-                    e->tex->height, e->tex->format, e->tex->addr, total, nz, renderer_is_gpu_owned(e->tex));
+                LOG("[dtex] slot %d tex %ux%u f%#x addr %llx size %llu nonzero %llu gpu_owned %d levels %u view %s%u+%u\n", i,
+                    e->tex->width, e->tex->height, e->tex->format, e->tex->addr, total, nz, renderer_is_gpu_owned(e->tex),
+                    e->tex->levels, e->has_view && (e->view.setmask & 1) ? "" : "(none) ", e->view.base_level, e->view.num_levels);
             }
         }
         NvnSamplerDesc *sd = h && st.spool && tsc < (uint32_t)st.spool->count ? &((NvnSamplerDesc *)st.spool->entries)[tsc] : NULL;
         if (sd) smp = sampler_for(sd);
+        if (g_debug_frame && sd && stage == 1)
+            LOG("[dtex] slot %d sampler lod %g..%g bias %g, metal texture levels %lu\n", i, sd->lod_min, sd->lod_max, sd->lod_bias,
+                (unsigned long)tex.mipmapLevelCount);
         if (st_->shadow) tex = shadow_slot_texture(tex, st_, i, h);
         if (!tex) tex = dummy_texture(st_->type);
         if (!smp) smp = default_sampler();
@@ -2537,6 +2792,17 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
     }
 }
 
+// The vertex stage's uniform snapshots of the draw (motion vectors: this frame's constants of the draw, motion.h)
+static const uint8_t *vcb_data[18];
+static uint32_t vcb_size[18], vcb_off[18];
+static uint64_t vcb_id[18];
+static void vcb_note(int k, uint64_t off, uint64_t size) {
+    vcb_data[k] = (const uint8_t *)ring.contents + off;
+    vcb_size[k] = (uint32_t)size;
+    vcb_off[k] = (uint32_t)off;
+    vcb_id[k] = (uint64_t)ring_gen << 32 | off;
+}
+
 static void bind_cbufs(int stage, ShaderInfo *si) {
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
@@ -2579,6 +2845,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if (!r.addr) {
             static const uint8_t zeros[0x10000];
             uint64_t off = ring_alloc(zeros, size ? size : 256);
+            if (stage == 0) vcb_note(k, off, size ? size : 256);
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
             else [enc setFragmentBuffer:ring offset:off atIndex:k];
             continue;
@@ -2586,7 +2853,8 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;  // indexed: whole buffer
         if (size > r.size && r.size) size = r.size;
         if (size < 16) size = 16;
-        uint64_t off = ring_alloc((void *)(uintptr_t)r.addr, size);  // snapshot, as later CPU writes must not leak in
+        uint64_t off = snap_reuse(r.addr, size);  // snapshot, as later CPU writes must not leak in
+        if (stage == 0) vcb_note(k, off, size);
         if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
         else [enc setFragmentBuffer:ring offset:off atIndex:k];
     }
@@ -3198,6 +3466,101 @@ static id prep_find_pipe(NSString *body) {
     return p;
 }
 
+// The program's motion variant (motion.h), built off the render thread on first use: true once it's ready
+static bool prog_mv_ready(Prog *pr) {
+    int state = pr->mv_state;
+    if (state == 2) return true;
+    if (state != 0) return false;
+    pr->mv_state = -1;
+    if (!pr->vi || !pr->fi || !pr->vi->msl || !pr->fi->msl || pr->vi->uses_gmem_store) return false;
+    int slot[2], n = 0;  // (two vertex buffer slots the program's uniform buffers leave free)
+    for (int k = 16; k >= 3 && n < 2; k--) if (!(pr->vi->cbuf_mask & (1u << k))) slot[n++] = k;
+    if (n < 2) return false;
+    char *vs = mv_vs_msl(pr->vi->msl, pr->vi->cbuf_mask, slot[0], slot[1]), *fs = vs ? mv_fs_msl(pr->fi->msl) : NULL;
+    if (!vs || !fs) {
+        static int nlog;
+        if (nlog++ < 20) LOG("[mv] program %p: no motion variant (%s)\n", (__bridge void *)pr, vs ? "fragment" : "vertex");
+        free(vs); free(fs);
+        return false;
+    }
+    pr->mv_arena_slot = slot[0];
+    pr->mv_off_slot = slot[1];
+    pr->mv_state = 1;
+    static dispatch_queue_t q;
+    if (!q) q = dispatch_queue_create("larecomp.mv", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_async(q, ^{
+        static MTLCompileOptions *vopts;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
+        NSError *err = nil;
+        id<MTLLibrary> vl = [dev newLibraryWithSource:@(vs) options:vopts error:&err];
+        id<MTLLibrary> fl = vl ? [dev newLibraryWithSource:@(fs) options:nil error:&err] : nil;
+        if (!vl || !fl) {
+            static int nlog;
+            if (nlog++ < 10) LOG("[mv] variant compile failed: %s\n%s\n", err.localizedDescription.UTF8String, vl ? fs : vs);
+            pr->mv_state = -1;
+        } else {
+            pr->vs_mv = [vl newFunctionWithName:@"main0"];
+            pr->fs_mv = [fl newFunctionWithName:@"main0"];
+            pr->mv_state = pr->vs_mv && pr->fs_mv ? 2 : -1;
+        }
+        free(vs);
+        free(fs);
+    });
+    return false;
+}
+
+// The program's HUD variant (motion.h mv_fs_ui_msl), built like the motion one
+static bool prog_ui_ready(Prog *pr) {
+    int state = pr->ui_state;
+    if (state == 2) return true;
+    if (state != 0) return false;
+    pr->ui_state = -1;
+    if (!pr->fi || !pr->fi->msl || pr->fi->ntex > MSL_MAX_SAMPLERS) return false;
+    char *fs = mv_fs_ui_msl(pr->fi->msl);
+    if (!fs) return false;
+    pr->ui_state = 1;
+    static dispatch_queue_t q;
+    if (!q) q = dispatch_queue_create("larecomp.ui", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_async(q, ^{
+        NSError *err = nil;
+        id<MTLLibrary> fl = [dev newLibraryWithSource:@(fs) options:nil error:&err];
+        bool ok = fl != nil;
+        for (int m = 0; ok && m < 3; m++) {
+            MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+            int v = m;
+            [cv setConstantValue:&v type:MTLDataTypeInt atIndex:0];
+            pr->fs_ui[m] = [fl newFunctionWithName:@"main0" constantValues:cv error:&err];
+            ok = pr->fs_ui[m] != nil;
+        }
+        if (!ok) {
+            static int nlog;
+            if (nlog++ < 10) LOG("[mv] UI variant compile failed: %s\n%s\n", err.localizedDescription.UTF8String, fs);
+        }
+        pr->ui_state = ok ? 2 : -1;
+        free(fs);
+    });
+    return false;
+}
+
+// A motion draw's previous-frame constants: the history's (motion.h) for the same draw - among the draws of its
+// shaders, vertex streams, index range and instances - bound beside this frame's
+static void mv_bind(Prog *pr, CmdRec *r, bool indexed, uint32_t used_streams) {
+    uint64_t c[2] = {st.program->stages[0].code_addr, st.program->stages[1].code_addr};
+    uint64_t h = hmix(0xcbf29ce484222325ull, c, sizeof c);
+    h = hmix(h, r->x, sizeof r->x[0] * (indexed ? 7 : 5));
+    for (int s = 0; s < 12; s++) if (used_streams & (1u << s)) h = hmix(h, &st.vbuf[s].addr, sizeof st.vbuf[s].addr);
+    id<MTLBuffer> ab = nil;
+    uint32_t offs[18] = {0};
+    bool matched = false;
+    if (!mv_record(renderer_exec_frame(), h, pr->vi->cbuf_mask, vcb_data, vcb_size, vcb_id, &ab, offs, &matched)) {
+        ab = ring;  // (the history is full: this frame's constants, no motion)
+        memcpy(offs, vcb_off, sizeof offs);
+    }
+    [enc setVertexBuffer:ab offset:0 atIndex:pr->mv_arena_slot];
+    [enc setVertexBytes:offs length:sizeof offs atIndex:pr->mv_off_slot];
+}
+
 static void draw(CmdRec *r, bool indexed) {
     if (!st.program) { SKIPPED(); return; }
     static bool logged_modes;
@@ -3212,10 +3575,13 @@ static void draw(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-    g_draw_must_run = st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->target == 2;
+    extern bool renderer_texture_drawn_lately(NvnTexture *t);
+    g_draw_must_run = st.rt.ncolor && st.rt.color[0] && (st.rt.color[0]->target == 2 || !renderer_texture_drawn_lately(st.rt.color[0]));
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (pr && !pr->ready && sync_shaders()) @synchronized(pr) { if (!pr->ready && !pr->failed) compile_program(pr); }
     if (!pr || !pr->ready) { SKIPPED(); return; }
+    extern void renderer_texture_note_drawn(NvnTexture *t);
+    for (int i = 0; i < st.rt.ncolor; i++) { renderer_texture_note_drawn(st.rt.color[i]); linear_drawn_note(st.rt.color[i]); }
     {   // mirror mode (runtime/hle/mirror.c): the scene's composite into the window image is drawn mirrored - the
         // unblended full-screen draw sampling the scene image (the window images also serve as scratch
         // targets earlier in the frame: those draws sample much smaller images; the HUD after it blends)
@@ -3323,7 +3689,33 @@ static void draw(CmdRec *r, bool indexed) {
     // draws depth only: no fragment function, as on the Switch - its own fragment shader's discards would drop depth
     // the prepass writes, and its colour work is wasted (nvn.h nvn_bind_program).
     bool depth_only = (st.bound_stages & 1) && !(st.bound_stages & 2);
-    uint64_t phash = pipeline_state_hash(pr) ^ (depth_only ? 0x9e3779b97f4a7c15ull : 0);
+    // motion vectors: depth-writing draws of the scene write them (the motion target is in every pass with the scene's
+    // depth: the other draws' pipelines have it too, masked)
+    if (mv_enabled() && st.rt.depth && st.ds[0] && st.ds[1] && st.rt.ncolor) mv_count(st.rt.depth);
+    bool mv_draw = pass_mv && !depth_only && st.ds[0] && st.ds[1] && prog_mv_ready(pr);
+    int ui_mode = -1;  // (the UI layer: -1 untouched, else the HUD variant's mode)
+    if (mv_enabled() && st.rt.ncolor && st.rt.color[0]) {
+        extern NvnTexture *renderer_presented_texture(void);
+        NvnTexture *t0 = st.rt.color[0], *scr = renderer_presented_texture();
+        bool composite = scr && t0->width == scr->width && t0->height == scr->height && r->x[2] <= 6 && st.viewport[0][0] == 0 &&
+                         st.viewport[0][1] == 0 && st.viewport[0][2] >= t0->width && st.viewport[0][3] >= t0->height &&
+                         !(st.color_state[0] & 1) && pr->fi->ntex;
+        if (composite) {  // (the scene's composite, in its own pass or not; a copy of the owner keeps the layer)
+            bool copy = false;
+            for (int i = 0; i < pr->fi->ntex && !copy; i++) copy = ui_owner && shader_texture_object(1, &pr->fi->tex[i]) == ui_owner;
+            if (!copy) {
+                ui_clear = true;
+                ui_scene_ok = false;
+                if (pass_ui) ui_mode = 2, ui_clear = false;
+            }
+            ui_owner = t0;
+        } else if (pass_ui && t0 == ui_owner && !depth_only) ui_mode = st.color_state[0] & 1 ? 0 : 1;
+        bool want_clear = ui_mode == 2;
+        if (ui_mode >= 0 && !prog_ui_ready(pr)) ui_mode = -1;
+        if (want_clear && ui_mode < 0) ui_clear = true;  // (no clear variant yet: no layer until a pass clears it)
+    }
+    uint64_t phash = pipeline_state_hash(pr) ^ (depth_only ? 0x9e3779b97f4a7c15ull : 0) ^ (pass_mv ? 0x5bd1e9955bd1e995ull : 0) ^
+                     (mv_draw ? 0x27d4eb2f165667c5ull : 0) ^ (pass_ui ? 0x165667b19e3779f9ull : 0) ^ (uint64_t)(ui_mode + 1) * 0x85ebca77c2b2ae63ull;
     uint32_t pslot = (uint32_t)(phash ^ (phash >> 29)) & (PIPE_TAB - 1);
     while (pipe_tab[pslot].key && pipe_tab[pslot].key != phash) pslot = (pslot + 1) & (PIPE_TAB - 1);
     id<MTLRenderPipelineState> pipe = pipe_tab[pslot].key ? (__bridge id<MTLRenderPipelineState>)pipe_tab[pslot].pipe : nil;
@@ -3334,8 +3726,26 @@ static void draw(CmdRec *r, bool indexed) {
     attachment_formats(pd);
     pipeline_desc(pd, pr, &rec);
     if (depth_only) pd.fragmentFunction = nil;
+    if (pass_mv) pd.colorAttachments[MV_TARGET].writeMask = mv_draw ? MTLColorWriteMaskRed | MTLColorWriteMaskGreen : MTLColorWriteMaskNone;
+    if (mv_draw) pd.vertexFunction = pr->vs_mv, pd.fragmentFunction = pr->fs_mv;
+    if (pass_ui) {  // (the layer gets target 0's colour: blended with its colour factors, alpha as coverage)
+        MTLRenderPipelineColorAttachmentDescriptor *u = pd.colorAttachments[MV_TARGET], *c0 = pd.colorAttachments[0];
+        u.writeMask = ui_mode >= 0 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+        if (ui_mode == 0) {
+            u.blendingEnabled = YES;
+            u.sourceRGBBlendFactor = c0.sourceRGBBlendFactor;
+            u.destinationRGBBlendFactor = c0.destinationRGBBlendFactor;
+            u.rgbBlendOperation = c0.rgbBlendOperation;
+            u.sourceAlphaBlendFactor = MTLBlendFactorOne;
+            u.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            u.alphaBlendOperation = MTLBlendOperationAdd;
+        }
+        if (ui_mode >= 0) pd.fragmentFunction = pr->fs_ui[ui_mode];
+    }
     NSString *body = pipeline_key(pd, pr);
     if (depth_only) body = [body stringByAppendingString:@" depth-only"];
+    if (mv_draw) body = [body stringByAppendingString:@" mv"];
+    if (ui_mode >= 0) body = [body stringByAppendingFormat:@" ui%d", ui_mode];
     NSString *pk = [NSString stringWithFormat:@"%u %@", g_boot_gen, body];
     id pobj = cache[pk];
     NSMutableDictionary *ready_pipes = g_ready_pipes;  // async pipeline builds finished on Metal's threads
@@ -3350,7 +3760,7 @@ static void draw(CmdRec *r, bool indexed) {
         if (pobj == pending) pobj = nil;  // (a draw that must run: built here as well)
     }
     if (!pobj) {
-        if (shader_rec_recording()) shader_rec_note(&rec);
+        if (shader_rec_recording() && !mv_draw && ui_mode < 0) shader_rec_note(&rec);
         pobj = prep_find_pipe(body);  // prepared before the game
         if (pobj) cache[pk] = pobj;
         else shader_first_visit("pipeline", rec.vs, rec.fs, shader_code_hash((const uint8_t *)body.UTF8String, body.length));
@@ -3497,6 +3907,7 @@ static void draw(CmdRec *r, bool indexed) {
     // resources
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
+    if (mv_draw) mv_bind(pr, r, indexed, used_streams);
     // (debug, LARECOMP_LOG_BINDS) shaders loading global memory read through pointers in their uniform buffers: note
     // 4 KB at each heap pointer found in the bound uniforms, to see whether the game rewrites that data per frame
     if (pr->vi->uses_gmem || pr->fi->uses_gmem) {
@@ -3617,6 +4028,8 @@ static void draw(CmdRec *r, bool indexed) {
         }
         if (fkey.flip_x) rs[65][0] = (float)st.rt.color[0]->width;  // (mirror mode: the composite's width, guest pixels)
         [enc setFragmentBytes:rs length:(NSUInteger)(fkey.flip_x ? 66 : 1 + pr->fi->ntex) * 16 atIndex:RSCALE_BUFFER_INDEX];
+        if (g_debug_frame)
+            for (int i = 0; i <= pr->fi->ntex && i < 8; i++) LOG("[rscale] %d: %g %g %g %g\n", i, rs[i][0], rs[i][1], rs[i][2], rs[i][3]);
     }
     // (uniform buffer 2 = the model matrix - only when the vertex shader reads it: a binding left from an earlier draw
     // is another object's matrix)
@@ -3968,7 +4381,7 @@ static void draw_copy(id<MTLTexture> s, int sx0, int sy0, int sw, int sh, id<MTL
     stat_passes++;
 }
 
-static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
+static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst, bool flush) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     td_flush(t);
@@ -4007,7 +4420,30 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                 sourceSize:MTLSizeMake(rg[3], rg[4], array ? 1 : rg[5]) toBuffer:g_guest_buffer
          destinationOffset:dst - HEAP_BASE + (uint64_t)z * img destinationBytesPerRow:row destinationBytesPerImage:img];
     [b endEncoding];
-    renderer_flush();  // the CPU may read the result right after the fence
+    if (flush) renderer_flush();  // the CPU may read the result right after the fence
+}
+
+// The game may read a linear target without waiting on a fence that holds the copy (the camera hands its photo to
+// the album straight after): one drawn only now and then (not in the frame before) is waited for. Those drawn every
+// frame aren't, so they cost no stall.
+static void linear_drawn_write_back(void) {
+    static struct { NvnTexture *t; uint64_t frame; } last[LINEAR_DRAWN_MAX];
+    uint64_t frame = renderer_exec_frame(), row = st.copy_row_stride, img = st.copy_image_stride;
+    bool wait = false;
+    st.copy_row_stride = st.copy_image_stride = 0;  // (packed rows: NVN_TEX_LINEAR's layout)
+    for (int i = 0; i < nlinear_drawn; i++) {
+        NvnTexture *t = linear_drawn[i];
+        TexRefRec whole = {.tex = (uint64_t)(uintptr_t)t};
+        copy_texture_to_buffer(&whole, t->addr, false);
+        int k = 0, oldest = 0;
+        while (k < LINEAR_DRAWN_MAX && last[k].t != t) { if (last[k].frame < last[oldest].frame) oldest = k; k++; }
+        if (k == LINEAR_DRAWN_MAX) { k = oldest; last[k].t = t; last[k].frame = 0; }
+        if (last[k].frame + 1 < frame) wait = true;
+        last[k].frame = frame;
+    }
+    nlinear_drawn = 0;
+    st.copy_row_stride = row, st.copy_image_stride = img;
+    if (wait) renderer_flush();
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
@@ -4153,6 +4589,19 @@ static void exec_list(uint64_t handle, int depth) {
         prev = p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        // (state, draws, clears and copies of textures, barriers don't write guest memory; the commands below that
+        // write a known range note it; anything else may write anywhere: snapshots are all taken again after it)
+        switch (r->op) {
+        case CMD_BIND_PROGRAM ... CMD_CLEAR_TEXTURE: case CMD_DRAW_ARRAYS ... CMD_DRAW_ELEMENTS_INDIRECT: case CMD_END: case CMD_JUMP: case CMD_CALL:
+        case CMD_BARRIER: case CMD_DISCARD_COLOR: case CMD_DISCARD_DEPTH_STENCIL: case CMD_COPY_BUFFER_TO_TEXTURE:
+        case CMD_COPY_TEXTURE_TO_TEXTURE: case CMD_DOWNSAMPLE: case CMD_DRAW_TEXTURE: case CMD_RESOLVE_DEPTH: break;
+        case CMD_UPDATE_UNIFORM_BUFFER: snap_wrote(r->x[0] + r->x[2], r->x[3]); break;
+        case CMD_REPORT_VALUE: snap_wrote(r->x[1], 4); break;
+        case CMD_REPORT_COUNTER: snap_wrote(r->x[1], 16); break;
+        case CMD_CLEAR_BUFFER: snap_wrote(r->x[0], r->x[1]); break;
+        case CMD_COPY_BUFFER_TO_BUFFER: snap_wrote(r->x[1], r->x[2]); break;
+        default: snap_invalidate();
+        }
         if (st.render_off && (r->op == CMD_CLEAR_COLOR || r->op == CMD_CLEAR_DEPTH_STENCIL || r->op == CMD_CLEAR_TEXTURE ||
                               r->op == CMD_DRAW_ARRAYS || r->op == CMD_DRAW_ELEMENTS || r->op == CMD_DRAW_ARRAYS_INDIRECT ||
                               r->op == CMD_DRAW_ELEMENTS_INDIRECT)) {
@@ -4426,6 +4875,7 @@ static void exec_list(uint64_t handle, int depth) {
             // The CPU may read GPU-written memory (compute results) once the fence is signaled.
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
+            if (nlinear_drawn) linear_drawn_write_back();  // (a fence inside the list)
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
             if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
@@ -4470,15 +4920,17 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_TEXTURE_TO_TEXTURE: {
             const TexRefRec *t = x;
             copy_texture(&t[0], &t[1], r->x[6]);
+            linear_drawn_note((NvnTexture *)(uintptr_t)t[1].tex);
             break;
         }
         case CMD_DOWNSAMPLE: {
             const TexRefRec *t = x;
             copy_texture(&t[0], &t[1], 1);
+            linear_drawn_note((NvnTexture *)(uintptr_t)t[1].tex);
             break;
         }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
-        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3], true); break;
         case CMD_CLEAR_BUFFER:  // (address, size, 32-bit value) in command order
             if (r->x[0] < GUEST_LO || r->x[0] + r->x[1] > GUEST_HI) break;
             renderer_flush();
@@ -4597,8 +5049,12 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
 }
 
 void renderer_reset(void) {
+    mv_depth = NULL;  // (motion vectors: no scene, no history)
+    ui_owner = NULL;
+    mv_reset();
     memset(td_tab, 0, sizeof td_tab);  // (recorded clears and depth guesses of the old boot's textures)
     td_pending = 0;
+    nlinear_drawn = 0;
     renderer_flush();
     pthread_mutex_lock(&gone_lock);
     ngone = 0;
@@ -4634,7 +5090,9 @@ void renderer_reset(void) {
 
 void backend_execute(uint64_t handle) {
     @autoreleasepool {
+        snap_invalidate();  // (the CPU may have written anything since the last list)
         exec_list(handle, 0);
+        if (nlinear_drawn) linear_drawn_write_back();  // (queue fences come after the list: nvnQueueFenceSync)
         static int sync_submit = -1;
         if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
         if (sync_submit) renderer_flush();  // old behaviour: finish the GPU work before returning

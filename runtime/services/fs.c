@@ -1084,6 +1084,33 @@ static Service *open_host_fs(const char *sub) {
     return svc;
 }
 
+// IMultiCommitManager: commits several save mounts together (Animal Crossing, upgrading a save to a new version). The
+// host commits each mount in turn.
+typedef struct { Service *fs[10]; int n; } MultiCommit;
+
+static void multi_commit_close(Service *s) {
+    MultiCommit *m = s->state;
+    for (int i = 0; i < m->n; i++) service_release(m->fs[i]);
+    free(m);
+}
+
+static void multi_commit(Service *s, IpcReq *req, IpcResp *resp) {
+    MultiCommit *m = s->state;
+    switch (req->cmd) {
+    case 1: {  // Add(IFileSystem)
+        Service *o = req->nin_objects ? req->in_objects[0] : NULL;
+        if (!o || o->handler != filesystem || m->n == 10) { resp->result = MAKE_RESULT(2, 6000); break; }
+        o->refs++;
+        m->fs[m->n++] = o;
+        break;
+    }
+    case 2:  // Commit
+        for (int i = 0; i < m->n; i++) commit(m->fs[i]->state);
+        break;
+    default: LOG("[fs] IMultiCommitManager cmd %u (ok)\n", req->cmd);
+    }
+}
+
 // ------------------------------------------------------------------ fsp-srv
 SERVICE("fsp-srv", fsp_srv) {
     (void)s;
@@ -1105,6 +1132,12 @@ SERVICE("fsp-srv", fsp_srv) {
         LOG("[fs] OpenDataStorageByDataId %llx (not available)\n", IN(uint64_t, 8));
         resp->result = MAKE_RESULT(2, 1001);
         break;
+    case 1200: {  // OpenMultiCommitManager
+        Service *m = service_new("IMultiCommitManager", multi_commit, calloc(1, sizeof(MultiCommit)));
+        m->on_close = multi_commit_close;
+        ipc_return_object(resp, m);
+        break;
+    }
     case 1005: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetGlobalAccessLogMode
     case 1003: case 1004: case 1006: break;
     case 1011: memset(resp->data, 0, 0x10); resp_size(resp, 0x10); break;

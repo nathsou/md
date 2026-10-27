@@ -133,7 +133,7 @@ static Service *new_am_storage(const void *data, uint64_t size) {
     return service_new("IStorage", am_storage, st);
 }
 
-extern const uint8_t g_user_id[16];
+extern uint8_t g_user_id[16];
 
 static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;

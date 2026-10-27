@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "../kernel.h"
+#include "../game.h"
+#include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
 
@@ -483,6 +485,13 @@ NVN(nvnTextureInitialize) {
     if (t->flags & 2)
         LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
             t->format, t->flags, t->target, t->addr, t->stride);
+    if ((t->flags & 0x40) && getenv("LARECOMP_LOG_LINEAR")) {
+        static int n;
+        if (n++ < 20)
+            LOG("[nvn] linear render target %ux%u fmt %#x flags %#x target %u levels %u addr %llx stride %llu size %llu\n",
+                t->width, t->height, t->format, t->flags, t->target, t->levels, t->addr, t->stride,
+                (unsigned long long)tegra_total_size(&t->layout));
+    }
     SET_HOST(A(0), t);
     RET(1);
 }
@@ -826,7 +835,14 @@ NVN(nvnWindowInitialize) {
     w->interval = (int)G(uint32_t, A(1), 0x20);
     w->active = G(uint32_t, A(1), 0x24) ? (int)G(uint32_t, A(1), 0x24) : w->num;
     SET_HOST(A(0), w);
-    LOG("[nvn] window with %d textures\n", w->num);
+    for (int i = 0; i < w->num; i++) {  // (screen images: at the output resolution, nvn.h NVN_TEX_HOST_WINDOW)
+        NvnTexture *t = HOST(NvnTexture, w->textures[i]);
+        if (!t) continue;
+        t->flags |= NVN_TEX_HOST_WINDOW;
+        extern bool renderer_texture_promote_scalable(NvnTexture *t);
+        if (t->backend) renderer_texture_promote_scalable(t);
+    }
+    LOG("[nvn] window with %d textures, present interval %d\n", w->num, w->interval);
     RET(1);
 }
 NVN(nvnWindowFinalize) { (void)c; }
@@ -863,9 +879,30 @@ NVN(nvnQueueAcquireTexture) {
     RET(0);
 }
 volatile uint64_t g_nvn_presents;  // presents so far (cmdbuf.c's list origins, debug)
+// The Switch shows a frame `interval` vsyncs (60 Hz) after the one before it, and the game's next frame waits for that:
+// a game in its 30 fps mode (interval 2) runs at 30 whatever the display. Unless the game runs uncapped
+// (GAME_UNCAPPED_FPS, LARECOMP_UNCAPPED=1), the presenting thread waits here until its frame's vsync. On a 60 Hz grid:
+// a frame late by less than a vsync keeps the grid (it takes the next slot), a later one starts it over.
+volatile int g_present_interval;  // the game's present interval as paced here (0: uncapped): metal.m frame generation
+static void present_wait(int interval) {
+    static int uncapped = -1;
+    if (uncapped < 0) uncapped = game_flag(GAME_UNCAPPED_FPS) || (getenv("LARECOMP_UNCAPPED") && atoi(getenv("LARECOMP_UNCAPPED")));
+    g_present_interval = uncapped ? 0 : interval;
+    if (uncapped || interval < 1) return;
+    const uint64_t vsync = 16666667;
+    static uint64_t due;  // when this frame may be shown (the last one's + its interval)
+    uint64_t now = plat_now_ns();
+    if (due > now) {
+        plat_sleep_until_ns(due);
+        extern __thread uint64_t g_blocked_ns;  // (kernel.c: waiting is idle time)
+        g_blocked_ns += plat_now_ns() - now;
+    } else if (now - due >= vsync) due = now;
+    due += (uint64_t)interval * vsync;
+}
 NVN(nvnQueuePresentTexture) {
     g_nvn_presents++;
     NvnWindow *w = HOST(NvnWindow, A(1));
+    present_wait(w->interval);
     int i = (int)A(2);
     if (getenv("LARECOMP_LOG_PRESENT")) {
         static int n;

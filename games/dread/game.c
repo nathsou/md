@@ -27,6 +27,6 @@ static const GameProfile dread = {
     .versions = versions,
     .nversions = sizeof versions / sizeof versions[0],
     .hook = dread_hook,
-    .flags = GAME_CLEAR_SCREEN_TARGETS,
+    .flags = GAME_CLEAR_SCREEN_TARGETS | GAME_UNCAPPED_FPS,
 };
 RT_GAME(dread);

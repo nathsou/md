@@ -1,10 +1,25 @@
 // acc:u0 (one local user) and the preselected-user launch parameter.
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../hle.h"
 #include "../ipc.h"
 
-const uint8_t g_user_id[16] = {0x4c, 0x41, 0x52, 0x65, 0x63, 0x6f, 0x6d, 0x70, 0x01, 0, 0, 0, 0, 0, 0, 0x01};
+uint8_t g_user_id[16] = {0x4c, 0x41, 0x52, 0x65, 0x63, 0x6f, 0x6d, 0x70, 0x01, 0, 0, 0, 0, 0, 0, 0x01};
+
+// LARECOMP_USER_ID=<32 hex digits, in memory order>: the account a save was made with (Animal Crossing ties each
+// resident to one; tools/acnh_save.py prints the IDs a save holds). Without it, a save from elsewhere starts a new
+// resident.
+__attribute__((constructor)) static void user_id_from_env(void) {
+    const char *e = getenv("LARECOMP_USER_ID");
+    if (!e || strlen(e) != 32) return;
+    for (int i = 0; i < 16; i++) {
+        unsigned v;
+        if (sscanf(e + 2 * i, "%2x", &v) != 1) return;
+        g_user_id[i] = (uint8_t)v;
+    }
+}
 
 static void write_uid_list(IpcReq *req) {
     IpcBuf *c = out_buf(req, 0);

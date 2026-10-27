@@ -16,6 +16,14 @@
 #define SET_HOST(guest, p) (*(uint64_t *)(uintptr_t)(guest) = (uint64_t)(uintptr_t)(p))
 #define G(T, base, off) (*(T *)((uint8_t *)(uintptr_t)(base) + (off)))
 
+// Texture flags whose texels are pitch-linear (rows of `stride` bytes, or packed) rather than block-linear: LINEAR (0x10)
+// and LINEAR_RENDER_TARGET (0x40, ACNH's My Design images: read as block-linear, the island flag came out scrambled).
+// (Storage sizes stay the block-linear ones for 0x40: ACNH gives those no stride)
+// (host-only flag) a texture of an NVN window: the game's screen image, scaled with the output resolution even
+// without the compressible flag (0x8) the scaler otherwise looks for (ACNH's window textures have none)
+#define NVN_TEX_HOST_WINDOW 0x80000000u
+#define NVN_TEX_LINEAR(flags) (((flags) & 0x50u) != 0)
+
 typedef struct NvnPool {
     uint64_t storage, size;
     uint32_t flags;
