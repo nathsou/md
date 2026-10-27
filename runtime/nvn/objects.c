@@ -893,7 +893,13 @@ static void present_wait(int interval) {
     static uint64_t due;  // when this frame may be shown (the last one's + its interval)
     uint64_t now = plat_now_ns();
     if (due > now) {
+        // (a kernel wait on the Switch: the core goes to its other threads meanwhile. Sleeping on it held up to a frame
+        // a core Animal Crossing's sound thread needed - its audio thread, waiting for that one's mutex, missed its 5 ms
+        // updates: crackling, dropouts)
+        extern void kernel_block_begin(void), kernel_sched_point(void);
+        kernel_block_begin();
         plat_sleep_until_ns(due);
+        kernel_sched_point();
         extern __thread uint64_t g_blocked_ns;  // (kernel.c: waiting is idle time)
         g_blocked_ns += plat_now_ns() - now;
     } else if (now - due >= vsync) due = now;
