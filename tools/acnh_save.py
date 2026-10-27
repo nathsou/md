@@ -72,6 +72,17 @@ def residents(main):
     return None, []
 
 
+# The version a save was last written by: mainHeader.dat's save revision (u16 at 0xE; NHSE's table). A game version
+# loads saves of its own revision or older (older ones it offers to upgrade); a newer one is "damaged save data".
+VERSIONS = ('1.0.0 1.1.0 1.1.1 1.1.2 1.1.3 1.1.4 1.2.0 1.2.1 1.3.0 1.3.1 1.4.0 1.4.1 1.4.2 1.5.0 1.5.1 1.6.0 1.7.0 1.8.0 '
+            '1.9.0 1.10.0 1.11.0 1.11.1 2.0.0 2.0.1 2.0.2 2.0.3 2.0.4 2.0.5 2.0.6 2.0.7 2.0.8 3.0.0 3.0.1 3.0.2 3.0.3').split()
+
+
+def version(d):
+    rev = struct.unpack_from('<H', Path(f'{d}/mainHeader.dat').read_bytes(), 0xE)[0]
+    return VERSIONS[rev] if rev < len(VERSIONS) else f'save revision {rev}'
+
+
 def main():
     d = sys.argv[1]
     if len(sys.argv) == 5 and sys.argv[2] == '--decrypt':
@@ -82,7 +93,7 @@ def main():
         sys.exit('no resident table found in main.dat')
     for uid, _, player, island in found:
         print(f'{player} of {island}: LARECOMP_USER_ID={uid.hex()}')
-    print(f'(resident table at main.dat {o:#x})')
+    print(f'(saved by version {version(d)}; resident table at main.dat {o:#x})')
 
 if __name__ == '__main__':
     main()

@@ -3,7 +3,8 @@
 # Switch save dump or a save/acnh/save_0 copy has them) is booted from a scratch copy as the account its first resident
 # belongs to (tools/acnh_save.py), taken through the title and Isabelle's announcement, then walks the island, opens
 # the NookPhone and the pockets, and is captured along the way. Once in the day and once at night (the clock shifted
-# by NIGHT_OFFSET seconds, default 13 h). A save from an older version is upgraded by the game first (it asks).
+# by NIGHT_OFFSET seconds, default 13 h). A save from an older version is upgraded by the game first (it asks); one
+# from a newer version than GAME_DIR's is refused by the game as damaged (tools/acnh_save.py prints a save's version).
 # Results: build/acnh_cp/<save>-{day,night}/{frame_*.png,run.log,status}; the saves themselves are not touched.
 # usage: tools/acnh_saves.sh <dir of save folders, or one save folder> [jobs]
 #        GAME_DIR=data/acnh (default data/acnh-2.0.7) runs another version; EXPLORE=<seconds> (default 90)
