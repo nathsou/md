@@ -177,7 +177,19 @@ static uint8_t test_keys[SDL_SCANCODE_COUNT];
 static _Atomic uint32_t test_pad;
 static _Atomic int32_t test_lx, test_ly;  // (a resting stick's drift: "lstick" in LARECOMP_HOST_INPUT)
 
-static int held_key(int sc) { return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]); }
+static int key_down(int sc) { return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]); }
+
+// Typing (nn::hid::GetKeyboardState, below): while the game reads the keyboard for text - Animal Crossing's text entry
+// polls it from a call site of its own, besides the one polling every frame - the keys that type (letters, digits,
+// space, punctuation, Backspace) go to the game as a USB keyboard's and stop pressing their bound buttons (WASD would
+// move the cursor, K confirm). Enter, Escape, the arrows and the rest keep their bindings (Enter = + = confirm / send).
+static _Atomic bool text_mode;
+static _Atomic uint8_t key_tapped[SDL_SCANCODE_COUNT];  // (pressed since text entry's last poll: a quick tap still types)
+static bool types(int sc) {
+    return (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_0) || sc == SDL_SCANCODE_BACKSPACE ||
+           (sc >= SDL_SCANCODE_SPACE && sc <= SDL_SCANCODE_SLASH);
+}
+static int held_key(int sc) { return key_down(sc) && !(text_mode && types(sc)); }
 
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
@@ -441,6 +453,7 @@ void input_handle_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode < SDL_SCANCODE_COUNT && !e->key.repeat) key_tapped[e->key.scancode] = 1;
         uint64_t before = key_buttons;
         recompute_keyboard();
         uint64_t now = key_buttons;
@@ -1004,9 +1017,41 @@ HLE_FUNC("_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EE
     *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
     c->x[0] = 1;
 }
+// KeyboardState (SDK, 0x30 bytes): int64 sampling, KeyboardModifierSet (32 bits: 0 Control, 1 Shift, 2 LeftAlt,
+// 3 RightAlt, 4 Gui, 8 CapsLock), KeyboardAttributeSet (bit 0: connected), KeyboardKeySet (256 bits, by USB usage ID -
+// SDL's scancodes). A connected keyboard and its keys only in text mode (above): the call site polling every frame since
+// the start is the game's own; another one polling (the last 3 frames) is text entry.
 HLE_FUNC("_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE", hid_keyboard_state) {
-    memset((void *)(uintptr_t)c->x[0], 0, 0x2C);  // sampling, modifiers, keys[256 bits]
-    *(int64_t *)(uintptr_t)c->x[0] = ++other_sampling;
+    extern uint64_t renderer_present_count(void);
+    static uint64_t base_lr, text_at;
+    uint64_t lr = c->x[30], f = renderer_present_count();
+    if (!base_lr) base_lr = lr;
+    if (lr != base_lr) text_at = f + 1;
+    bool on = text_at && text_at + 3 >= f + 1;
+    if (on != text_mode) {
+        text_mode = on;
+        if (on) for (int i = 0; i < SDL_SCANCODE_COUNT; i++) key_tapped[i] = 0;  // (typed before it opened: not text)
+        LOG("[input] text entry %s (keyboard typing %s)\n", on ? "open" : "closed", on ? "on" : "off");
+        recompute_keyboard();
+    }
+    uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
+    memset(s, 0, 0x30);
+    *(int64_t *)s = ++other_sampling;
+    if (!on) return;
+    *(uint32_t *)(s + 0xC) = 1;  // (connected)
+    uint32_t mods = 0, *keys = (uint32_t *)(s + 0x10);
+    for (int sc = SDL_SCANCODE_A; sc <= SDL_SCANCODE_RGUI; sc++) {
+        bool tap = key_tapped[sc] && (lr != base_lr ? atomic_exchange(&key_tapped[sc], 0) : true);
+        if (!key_down(sc) && !tap) continue;
+        if (types(sc) || sc >= SDL_SCANCODE_LCTRL) keys[sc >> 5] |= 1u << (sc & 31);
+        if (sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL) mods |= 1u << 0;
+        if (sc == SDL_SCANCODE_LSHIFT || sc == SDL_SCANCODE_RSHIFT) mods |= 1u << 1;
+        if (sc == SDL_SCANCODE_LALT) mods |= 1u << 2;
+        if (sc == SDL_SCANCODE_RALT) mods |= 1u << 3;
+        if (sc == SDL_SCANCODE_LGUI || sc == SDL_SCANCODE_RGUI) mods |= 1u << 4;
+    }
+    if (SDL_GetModState() & SDL_KMOD_CAPS) mods |= 1u << 8;
+    *(uint32_t *)(s + 8) = mods;
 }
 HLE_FUNC("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", hid_mouse_states) {
     if ((int)c->x[1] < 1) { c->x[0] = 0; return; }

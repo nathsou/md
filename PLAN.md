@@ -407,8 +407,10 @@ Engine fixes it needed, all shared:
   frame, a new 64 MB ring every ~15 ms, a quarter of the render thread. renderer.m's snap_reuse shares a snapshot
   until a command writes its range (uniform updates, counter reports, buffer clears and copies) or may write anywhere
   (dispatches, fences, a new list). ACNH uncapped on an M4 Pro: 77 -> 115 fps at 1440p, 98 fps at 4K
-  (LARECOMP_SNAP_VERIFY=1 compares each shared snapshot with memory: one 256-byte buffer the game rewrites for its
-  next frame while this one is translated differs, as it raced before). ACNH draws no motion vectors (one color
+  (LARECOMP_SNAP_VERIFY=1 compares each shared snapshot with memory: 0 of 204 M differ). A first version missed
+  writes that grew a range already logged (a write next to the last one extends it): the intro's depth of field read
+  the previous pass's constants, its blur sampled one texel and the wall behind Timmy and Tommy came out flat dark
+  grey, posters gone - each range now carries the write count when it last grew. ACNH draws no motion vectors (one color
   target and depth for its scene), which MetalFX's frame interpolator and temporal scaler would need.
 - Motion vectors and MetalFX frame interpolation (runtime/nvn/motion.m, framegen.m; `frame_generation_method =
   metalfx`, the default at 60): each program gets a variant whose vertex shader is the translated one as a function,
@@ -434,6 +436,20 @@ Engine fixes it needed, all shared:
   on macOS 27.0 gave black images). One in-between image only: 120 stays
   on the optical flow. Cost: uncapped 115 -> ~109 fps for the vectors; the in-between image's command buffer ~5.5 ms
   of GPU span against ~9 ms for the flow (2560x1440, M4 Pro).
+- Typing in ACNH's text entry (runtime/hle/input.c): nn::hid::GetKeyboardState answered "no keyboard". ACNH reads
+  a USB keyboard for its on-screen keyboard, polling it from a call site of its own (besides one polling every
+  frame): while that one polls, the keys that type are reported as a connected keyboard's (the SDK's 0x30-byte
+  KeyboardState: modifiers, attributes - connected -, keys by USB usage = SDL scancode) and stop pressing their bound
+  buttons; a key pressed and released between two polls still types.
+- Audio (runtime/services/audio.c): crackling - ACNH's whole mix goes through an Aux effect, the game's own
+  processing by its audio thread each 5 ms frame. That thread came every 10 to 34 ms: it waited for a mutex its sound
+  thread (priority 45, core 1) held, which waited for its core, held by the presenting thread (priority 30) asleep in
+  present_wait for frame pacing. The 5-frame Aux rings ran over; blocks came back part rewritten (a click every few
+  ms: 1,898 in 30 s). present_wait gives the core up while it sleeps (a kernel wait on the Switch): every 5.0 ms,
+  7 clicks. Splitters (ACNH: 6, 19 destinations) are routed (Ryujinx's SplitterContext; 2.0.7's layout: splitters
+  0x1C + 4n bytes, destinations 0x70 with the mix at 0x68, used at 0x6C). Not done: priority inheritance for
+  mutexes (Horizon has it; not needed for this once the core was free).
+
 - Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
   that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
   back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one

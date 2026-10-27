@@ -311,6 +311,46 @@ static void td_flush_targets(const RtState *rt) {
 void renderer_texture_will_read(NvnTexture *t) { td_flush(t); }  // (metal.m: the presented image)
 static NvnTexture *pass_depth;   // (debug frame) the open pass's depth target
 static NvnTexture *pass_color0;  // (debug frame) the open pass's first color target: st.rt may be the next pass's already
+// (debug frame, LARECOMP_DEBUG_VALUES=1) the values the pass left in its first colour target, as floats: each channel's
+// range and mean, and a few points (the image's top / middle / bottom thirds) - what a PNG of a float target can't show
+static void debug_pass_values(NvnTexture *nt, id<MTLTexture> t, int pass) {
+    static id<MTLComputePipelineState> pipe;
+    if (!pipe) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:
+            @"#include <metal_stdlib>\nusing namespace metal;\n"
+             "kernel void rd(texture2d<float> t [[texture(0)]], device float4 *o [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
+             "  if (p.x < t.get_width() && p.y < t.get_height()) o[p.y * t.get_width() + p.x] = t.read(p); }\n" options:nil error:&err];
+        pipe = lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rd"] error:&err] : nil;
+        if (!pipe) return;
+    }
+    if (t.textureType != MTLTextureType2D || t.sampleCount > 1 || renderer_format_is_depth(nt->format)) return;
+    NSUInteger w = t.width, h = t.height;
+    id<MTLBuffer> buf = [dev newBufferWithLength:w * h * 16 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> c = [renderer_queue() commandBuffer];
+    id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
+    [e setComputePipelineState:pipe];
+    [e setTexture:t atIndex:0];
+    [e setBuffer:buf offset:0 atIndex:0];
+    [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [e endEncoding];
+    [c commit];
+    [c waitUntilCompleted];
+    const float *v = buf.contents;
+    double mn[4] = {1e30, 1e30, 1e30, 1e30}, mx[4] = {-1e30, -1e30, -1e30, -1e30}, sum[4] = {0};
+    for (NSUInteger i = 0; i < w * h; i++)
+        for (int k = 0; k < 4; k++) { double x = v[i * 4 + k]; if (x < mn[k]) mn[k] = x; if (x > mx[k]) mx[k] = x; sum[k] += x; }
+    LOG("[values] pass %d %s %lux%lu f%#x:", pass, nt->label, (unsigned long)w, (unsigned long)h, nt->format);
+    for (int k = 0; k < 4; k++) LOG(" c%d %g..%g mean %g", k, mn[k], mx[k], sum[k] / (w * h));
+    LOG(" | points");
+    for (int py = 1; py <= 3; py++) for (int px = 1; px <= 3; px++) {
+        const float *q = v + ((h * (2 * py - 1) / 6) * w + w * (2 * px - 1) / 6) * 4;
+        LOG(" (%g %g %g %g)", q[0], q[1], q[2], q[3]);
+    }
+    const float *c0 = v, *c1 = v + (w - 1) * 4, *c2 = v + ((h - 1) * w) * 4;
+    LOG(" | corners (%g %g %g) (%g %g %g) (%g %g %g)\n", c0[0], c0[1], c0[2], c1[0], c1[1], c1[2], c2[0], c2[1], c2[2]);
+}
+
 static void end_pass(void) {
     if (!td_defer_on() && !opening_pass) td_flush_targets(&st.rt);  // (off mode: as before, the clear gets its pass now)
     if (enc) {
@@ -327,6 +367,7 @@ static void end_pass(void) {
             snprintf(apath, sizeof apath, "build/pass_%03d_a.png", debug_pass_no++);
             LOG("[metal] pass %d drew into %s (%ux%u)\n", debug_pass_no - 1, pass_color0->label, pass_color0->width, pass_color0->height);
             renderer_save_game_texture(pass_color0, t, path, apath);  // (the part the pass drew: Dynamic resolution)
+            if (getenv("LARECOMP_DEBUG_VALUES")) debug_pass_values(pass_color0, t, debug_pass_no - 1);
         }
         if (g_debug_frame && pass_depth && pass_depth->backend && getenv("LARECOMP_DEBUG_DEPTH")) {
             // (depth values: how many texels are at the far plane, the nearest one)
@@ -1318,17 +1359,22 @@ static uint64_t ring_off;
 // list - or a command writes their range (snap_wrote: uniform updates and counter reports, thousands a frame).
 static uint32_t snap_epoch = 1;
 static uint32_t ring_gen;  // (new rings: motion.h's ids of snapshots)
-static struct { uint64_t lo, hi; } snap_wlog[64];  // (ranges written since the epoch began, in order)
+// (ranges written since the epoch began, each with the write count when it last grew: a write next to the last range
+// extends it - the counter tells a snapshot taken before that growth from one taken after)
+static struct { uint64_t lo, hi, at; } snap_wlog[64];
 static uint32_t snap_nw;
+static uint64_t snap_writes;
 static void snap_invalidate(void) { snap_epoch++; snap_nw = 0; }
 static void snap_wrote(uint64_t addr, uint64_t size) {
+    snap_writes++;
     if (snap_nw && addr <= snap_wlog[snap_nw - 1].hi && addr + size >= snap_wlog[snap_nw - 1].lo) {  // (next to the last: one)
         if (addr < snap_wlog[snap_nw - 1].lo) snap_wlog[snap_nw - 1].lo = addr;
         if (addr + size > snap_wlog[snap_nw - 1].hi) snap_wlog[snap_nw - 1].hi = addr + size;
+        snap_wlog[snap_nw - 1].at = snap_writes;
         return;
     }
     if (snap_nw == 64) { snap_invalidate(); return; }
-    snap_wlog[snap_nw].lo = addr, snap_wlog[snap_nw].hi = addr + size, snap_nw++;
+    snap_wlog[snap_nw].lo = addr, snap_wlog[snap_nw].hi = addr + size, snap_wlog[snap_nw].at = snap_writes, snap_nw++;
 }
 
 static uint64_t ring_alloc(const void *data, uint64_t size) {
@@ -1355,15 +1401,16 @@ static void ring_reset(void) { ring_off = 0; snap_invalidate(); }
 // to draw after draw: copying them again was a quarter of the render thread's time in Animal Crossing). CPU stores
 // from other threads while a list is translated race on the Switch too: the GPU reads them whenever it gets there.
 static uint64_t snap_reuse(uint64_t addr, uint64_t size) {
-    static struct { uint64_t addr, size, off; uint32_t epoch, nw; } tab[1024];
+    static struct { uint64_t addr, size, off, at; uint32_t epoch; } tab[1024];  // (at: snap_writes when last current)
     __typeof__(&tab[0]) e = &tab[((addr >> 4) ^ (addr >> 14) ^ size) & 1023];
-    if (e->epoch == snap_epoch && e->addr == addr && e->size == size) {
-        uint32_t i = e->nw;
-        while (i < snap_nw && (addr >= snap_wlog[i].hi || addr + size <= snap_wlog[i].lo)) i++;
+    static int no_reuse = -1;  // LARECOMP_NO_SNAP_REUSE=1: every draw copies its own (A/B tests)
+    if (no_reuse < 0) no_reuse = getenv("LARECOMP_NO_SNAP_REUSE") != NULL;
+    if (!no_reuse && e->epoch == snap_epoch && e->addr == addr && e->size == size) {
+        uint32_t i = 0;  // (a range written, or grown, since the snapshot was last known current: taken again)
+        while (i < snap_nw && (snap_wlog[i].at <= e->at || addr >= snap_wlog[i].hi || addr + size <= snap_wlog[i].lo)) i++;
         if (i == snap_nw) {
-            // LARECOMP_SNAP_VERIFY=1: check each shared snapshot against the memory it stands for. (Animal Crossing:
-            // one 256-byte buffer differs now and then - the game's CPU rewriting it for its next frame while this one
-            // is translated; each draw copying it raced the same way)
+            // LARECOMP_SNAP_VERIFY=1: check each shared snapshot against the memory it stands for (the intro's depth of
+            // field took a stale one: a uniform update next to the last one written grew a range already checked)
             static int verify = -1;
             if (verify < 0) verify = getenv("LARECOMP_SNAP_VERIFY") != NULL;
             if (verify) {
@@ -1374,13 +1421,13 @@ static uint64_t snap_reuse(uint64_t addr, uint64_t size) {
                         (unsigned long long)size, (unsigned long long)bad, (unsigned long long)n);
                 if (!(n & 0xFFFFF)) LOG("[snap] %llu shared uniform snapshots checked, %llu differed\n", (unsigned long long)n, (unsigned long long)bad);
             }
-            e->nw = snap_nw;
+            e->at = snap_writes;
             stat_ring_reused += size;
             return e->off;
         }
     }
     uint64_t off = ring_alloc((void *)(uintptr_t)addr, size);
-    e->addr = addr, e->size = size, e->off = off, e->epoch = snap_epoch, e->nw = snap_nw;  // (after: a new ring moved the epoch)
+    e->addr = addr, e->size = size, e->off = off, e->epoch = snap_epoch, e->at = snap_writes;  // (after: a new ring moved the epoch)
     return off;
 }
 
