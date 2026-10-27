@@ -367,7 +367,9 @@ Engine fixes it needed, all shared:
 - Draws into targets not drawn the frame before (one-shot renders) wait for their shaders instead of being skipped.
 - Audio renderer effects ported from Ryujinx: I3DL2 reverb (5: rooms, ACNH and Dread), delay (3), biquad filter (6).
   Its Cos / Sin take degrees and its Pow10 clamps (radians made the reverb's feedback network diverge: NaN after
-  ~50 s of Dread); a non-finite state resets the effect. Aux (2) still passes audio through.
+  ~50 s of Dread); a non-finite state resets the effect. Aux (2, Ryujinx's AuxiliaryBufferCommand): the mix goes to
+  the game through the send buffer's ring and comes back from the return buffer's (ACNH taps its 6-channel final mix
+  this way and returns it unchanged; before, the output buffers weren't written).
 - Known, not done:
   an 8x8x8 3D texture left bound to a 2D slot of a UI shader reads the dummy (undefined on the Switch too).
 - Testing aids: `LARECOMP_HIDDEN=1 LARECOMP_DISPLAY_SYNC=0 LARECOMP_UNCAPPED=1` runs the intro at 120 fps off screen;

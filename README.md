@@ -45,7 +45,7 @@ profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#
   where you can walk around and play, at 120 fps.
 - **Game updates** are applied when extracting (`--update`): the update's code and its romfs patch over the base
   game's.
-- Not done: an in-game menu, the I3DL2 reverb audio effect, online features, Linux and Windows (the Vulkan backend
+- Not done: an in-game menu, online features, Linux and Windows (the Vulkan backend
   from LASRecomp is there but has not been built).
 
 See [PLAN.md](PLAN.md) for the design, the full status and the known problems.
