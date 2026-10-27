@@ -242,6 +242,22 @@ static TexDefer *td_get(NvnTexture *t, bool create) {
     return NULL;
 }
 
+// Linear render targets (NVN_TEX_LINEAR) drawn or copied into: the CPU reads what the GPU drew there (Animal
+// Crossing's camera renders its photo into one and hands that memory to the album). Each is copied back to guest
+// memory at the next fence in the list or at the list's end (linear_drawn_write_back).
+#define LINEAR_DRAWN_MAX 16
+static NvnTexture *linear_drawn[LINEAR_DRAWN_MAX];
+static int nlinear_drawn;
+static void linear_drawn_note(NvnTexture *t) {
+    if (!t || !(t->flags & 0x40) || t->target != 1 || t->addr < HEAP_BASE) return;
+    for (int i = 0; i < nlinear_drawn; i++) if (linear_drawn[i] == t) return;
+    if (nlinear_drawn < LINEAR_DRAWN_MAX) linear_drawn[nlinear_drawn++] = t;
+}
+static void linear_drawn_forget(NvnTexture *t) {
+    for (int i = 0; i < nlinear_drawn; i++)
+        if (linear_drawn[i] == t) { linear_drawn[i] = linear_drawn[--nlinear_drawn]; return; }
+}
+
 static void td_forget(NvnTexture *t) {  // (the texture is gone: drain_gone)
     TexDefer *e = td_get(t, false);
     if (!e) return;
@@ -475,6 +491,7 @@ static void drain_gone(void) {
         if (local[i].mtl) views_forget(local[i].mtl);
         if (local[i].nvn) {
             td_forget(local[i].nvn);
+            linear_drawn_forget(local[i].nvn);
             if (g_snap_copies) [g_snap_copies removeObjectForKey:[NSValue valueWithPointer:local[i].nvn]];
             for (int k = 0; k < 8; k++) if (snap_tex[k] == local[i].nvn) { snap_tex[k] = NULL; snap_ok[k] = false; }
         }
@@ -3256,7 +3273,7 @@ static void draw(CmdRec *r, bool indexed) {
     if (pr && !pr->ready && sync_shaders()) @synchronized(pr) { if (!pr->ready && !pr->failed) compile_program(pr); }
     if (!pr || !pr->ready) { SKIPPED(); return; }
     extern void renderer_texture_note_drawn(NvnTexture *t);
-    for (int i = 0; i < st.rt.ncolor; i++) renderer_texture_note_drawn(st.rt.color[i]);
+    for (int i = 0; i < st.rt.ncolor; i++) { renderer_texture_note_drawn(st.rt.color[i]); linear_drawn_note(st.rt.color[i]); }
     {   // mirror mode (runtime/hle/mirror.c): the scene's composite into the window image is drawn mirrored - the
         // unblended full-screen draw sampling the scene image (the window images also serve as scratch
         // targets earlier in the frame: those draws sample much smaller images; the HUD after it blends)
@@ -4011,7 +4028,7 @@ static void draw_copy(id<MTLTexture> s, int sx0, int sy0, int sw, int sh, id<MTL
     stat_passes++;
 }
 
-static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
+static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst, bool flush) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     td_flush(t);
@@ -4050,7 +4067,30 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                 sourceSize:MTLSizeMake(rg[3], rg[4], array ? 1 : rg[5]) toBuffer:g_guest_buffer
          destinationOffset:dst - HEAP_BASE + (uint64_t)z * img destinationBytesPerRow:row destinationBytesPerImage:img];
     [b endEncoding];
-    renderer_flush();  // the CPU may read the result right after the fence
+    if (flush) renderer_flush();  // the CPU may read the result right after the fence
+}
+
+// The game may read a linear target without waiting on a fence that holds the copy (the camera hands its photo to
+// the album straight after): one drawn only now and then (not in the frame before) is waited for. Those drawn every
+// frame aren't, so they cost no stall.
+static void linear_drawn_write_back(void) {
+    static struct { NvnTexture *t; uint64_t frame; } last[LINEAR_DRAWN_MAX];
+    uint64_t frame = renderer_exec_frame(), row = st.copy_row_stride, img = st.copy_image_stride;
+    bool wait = false;
+    st.copy_row_stride = st.copy_image_stride = 0;  // (packed rows: NVN_TEX_LINEAR's layout)
+    for (int i = 0; i < nlinear_drawn; i++) {
+        NvnTexture *t = linear_drawn[i];
+        TexRefRec whole = {.tex = (uint64_t)(uintptr_t)t};
+        copy_texture_to_buffer(&whole, t->addr, false);
+        int k = 0, oldest = 0;
+        while (k < LINEAR_DRAWN_MAX && last[k].t != t) { if (last[k].frame < last[oldest].frame) oldest = k; k++; }
+        if (k == LINEAR_DRAWN_MAX) { k = oldest; last[k].t = t; last[k].frame = 0; }
+        if (last[k].frame + 1 < frame) wait = true;
+        last[k].frame = frame;
+    }
+    nlinear_drawn = 0;
+    st.copy_row_stride = row, st.copy_image_stride = img;
+    if (wait) renderer_flush();
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
@@ -4469,6 +4509,7 @@ static void exec_list(uint64_t handle, int depth) {
             // The CPU may read GPU-written memory (compute results) once the fence is signaled.
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
+            if (nlinear_drawn) linear_drawn_write_back();  // (a fence inside the list)
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
             if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
@@ -4513,15 +4554,17 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_TEXTURE_TO_TEXTURE: {
             const TexRefRec *t = x;
             copy_texture(&t[0], &t[1], r->x[6]);
+            linear_drawn_note((NvnTexture *)(uintptr_t)t[1].tex);
             break;
         }
         case CMD_DOWNSAMPLE: {
             const TexRefRec *t = x;
             copy_texture(&t[0], &t[1], 1);
+            linear_drawn_note((NvnTexture *)(uintptr_t)t[1].tex);
             break;
         }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
-        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3], true); break;
         case CMD_CLEAR_BUFFER:  // (address, size, 32-bit value) in command order
             if (r->x[0] < GUEST_LO || r->x[0] + r->x[1] > GUEST_HI) break;
             renderer_flush();
@@ -4642,6 +4685,7 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
 void renderer_reset(void) {
     memset(td_tab, 0, sizeof td_tab);  // (recorded clears and depth guesses of the old boot's textures)
     td_pending = 0;
+    nlinear_drawn = 0;
     renderer_flush();
     pthread_mutex_lock(&gone_lock);
     ngone = 0;
@@ -4678,6 +4722,7 @@ void renderer_reset(void) {
 void backend_execute(uint64_t handle) {
     @autoreleasepool {
         exec_list(handle, 0);
+        if (nlinear_drawn) linear_drawn_write_back();  // (queue fences come after the list: nvnQueueFenceSync)
         static int sync_submit = -1;
         if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
         if (sync_submit) renderer_flush();  // old behaviour: finish the GPU work before returning

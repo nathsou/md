@@ -90,8 +90,9 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
    ./build/nx data/acnh
    ```
 
-   The app picks the game library built for those game files. Saves go to `save/<game>/`, settings to `nx.ini`,
-   shader caches to `cache/<game>/`, all in the repository folder.
+   The app picks the game library built for those game files. Saves go to `save/<game>/` (photos taken in a game,
+   such as Animal Crossing's camera app, to `save/<game>/album/`), settings to `nx.ini`, shader caches to
+   `cache/<game>/`, all in the repository folder.
 
 ## Controls
 

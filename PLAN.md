@@ -384,6 +384,11 @@ Engine fixes it needed, all shared:
   the Nook Stop terminal, the airport and a Nook Miles Ticket flight to a mystery island, night time, Save and end,
   and the saved game loading again. `tools/acnh_saves.sh` repeats the boot, a walk, the phone and the pockets, day and
   night, for a folder of saves.
+- Camera photos: the camera app renders the photo into a linear render target (NVN_TEX_LINEAR, 1280x720) and passes
+  that memory to caps:su's SaveScreenShotEx1 (205). The Metal backend now copies linear targets drawn or copied into
+  back to guest memory after each list (or at a fence inside one), and waits for the GPU when the target isn't one
+  drawn every frame (the game reads the photo without a fence that holds the copy). caps:su writes the image as a PNG
+  to `save/<game>/album/` (before: a stub, and the memory held whatever was there before).
 
 ### Generator
 - Jump tables whose bounds check sits far above the `br` (compilers schedule the per-case register setup in between:
