@@ -485,6 +485,13 @@ NVN(nvnTextureInitialize) {
     if (t->flags & 2)
         LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
             t->format, t->flags, t->target, t->addr, t->stride);
+    if ((t->flags & 0x40) && getenv("LARECOMP_LOG_LINEAR")) {
+        static int n;
+        if (n++ < 20)
+            LOG("[nvn] linear render target %ux%u fmt %#x flags %#x target %u levels %u addr %llx stride %llu size %llu\n",
+                t->width, t->height, t->format, t->flags, t->target, t->levels, t->addr, t->stride,
+                (unsigned long long)tegra_total_size(&t->layout));
+    }
     SET_HOST(A(0), t);
     RET(1);
 }

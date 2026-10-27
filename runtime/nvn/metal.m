@@ -574,7 +574,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     // linear textures are the CPU-written kind (the font glyph cache, 1024x2048 R8, video): checked in full every
     // frame from the start - a strided sample missed newly rasterized glyphs, so characters of new text popped in
     // seconds later (user 2026-10-08: file select "P ease se e t a i e.")
-    if (t->flags & 0x10) b->dynamic = true;
+    if (NVN_TEX_LINEAR(t->flags)) b->dynamic = true;
     if (full_hash_budget_frame != g_frame_counter) { full_hash_budget_frame = g_frame_counter; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
@@ -610,7 +610,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     if (!blit) { own_cb = [queue commandBuffer]; blit = [own_cb blitCommandEncoder]; }
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     uint64_t layer_size = tegra_layer_size(&t->layout);
-    bool linear = (t->flags & 0x10) != 0;
+    bool linear = NVN_TEX_LINEAR(t->flags);
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < t->layout.levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
@@ -619,7 +619,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             uint8_t *lin = malloc(sz);
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
-                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + y * t->stride, row);
+                // (LINEAR_RENDER_TARGET alone: rows packed - ACNH's builder stride, 4096 even for a 1x1, isn't the pitch)
+                uint64_t pitch = (t->flags & 0x10) && t->stride ? t->stride : row;
+                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + y * pitch, row);
             } else {
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }
