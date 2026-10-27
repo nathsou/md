@@ -169,6 +169,7 @@ typedef struct {
     float ax, ay;        // allocation scale (the Metal texture's size); sx, sy below: the scale its contents were drawn at
     bool presented;      // has been shown by backend_present (a swapchain image)
     uint64_t touched_frame;  // last frame it was written (cleared at the first write of a frame when reshaped)
+    uint64_t drawn_frame;    // last frame a draw into it ran, + 1 (0: never): renderer_texture_drawn_lately
     uint32_t level_gen;      // g_level_gen when last used as a render target
     uint64_t frame_cleared;  // LARECOMP_FRAME_CLEAR: frame it was last cleared at first use
     float sx, sy;        // allocation scale relative to the guest's size
@@ -299,6 +300,18 @@ bool renderer_texture_level_fresh(NvnTexture *t) {
 void renderer_texture_mark_presented(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (b) b->presented = true;
+}
+
+// Draws whose target the game draws every frame may be skipped while their shaders compile (a frame without them);
+// a target not drawn the frame before (drawn once: ACNH's sky panorama at boot, the colour LUT; or for the first
+// time) would keep the gap for good, so those draws wait for their shaders (renderer.m).
+bool renderer_texture_drawn_lately(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    return b && b->drawn_frame && b->drawn_frame + 1 >= renderer_exec_frame() + 1;
+}
+void renderer_texture_note_drawn(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    if (b) b->drawn_frame = renderer_exec_frame() + 1;
 }
 
 bool renderer_texture_presented(NvnTexture *t) {

@@ -1622,8 +1622,9 @@ static id<MTLComputePipelineState> archive_compute_pipeline(id<MTLFunction> f, N
 }
 
 // Draws whose output a later frame can't redo: the game renders some textures once (ACNH's colour grading 3D LUT,
-// eight slices drawn at boot), so skipping such a draw while its shaders compile would lose it for good. Draws into
-// 3D textures compile on the spot.
+// eight slices drawn at boot; its sky panorama, which the sea reflects: black water), so skipping such a draw while its
+// shaders compile would lose it for good. Draws into 3D textures, and into targets not drawn the frame before
+// (metal.m renderer_texture_drawn_lately), compile on the spot.
 static bool g_draw_must_run;
 static bool sync_shaders(void) {  // LARECOMP_SYNC_SHADERS: compile on first use, blocking (deterministic tests)
     static int v = -1;
@@ -1967,6 +1968,12 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        // (a cube array sampled as a cube - its first: ACNH's agl::env::CubeMap, which the sky panorama the sea reflects
+        // is made from; with the black dummy instead, the sea was dark navy)
+        else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureTypeCubeArray)
+            tex = view_cached(src, 0x6000000000000000ull | 4, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        else if (want == MTLTextureTypeCubeArray && tex.textureType == MTLTextureTypeCube)
+            tex = view_cached(src, 0x6000000000000000ull | 5, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCubeArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else {
             static int nlog;
             if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
@@ -3240,10 +3247,13 @@ static void draw(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-    g_draw_must_run = st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->target == 2;
+    extern bool renderer_texture_drawn_lately(NvnTexture *t);
+    g_draw_must_run = st.rt.ncolor && st.rt.color[0] && (st.rt.color[0]->target == 2 || !renderer_texture_drawn_lately(st.rt.color[0]));
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (pr && !pr->ready && sync_shaders()) @synchronized(pr) { if (!pr->ready && !pr->failed) compile_program(pr); }
     if (!pr || !pr->ready) { SKIPPED(); return; }
+    extern void renderer_texture_note_drawn(NvnTexture *t);
+    for (int i = 0; i < st.rt.ncolor; i++) renderer_texture_note_drawn(st.rt.color[i]);
     {   // mirror mode (runtime/hle/mirror.c): the scene's composite into the window image is drawn mirrored - the
         // unblended full-screen draw sampling the scene image (the window images also serve as scratch
         // targets earlier in the frame: those draws sample much smaller images; the HUD after it blends)
