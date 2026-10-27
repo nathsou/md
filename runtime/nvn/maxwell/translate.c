@@ -33,6 +33,7 @@ const uint8_t *maxwell_dbg_vs;
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
+#define SMEM_WORDS 8192  // shared memory per workgroup (32 KB: Metal's threadgroup memory limit; Maxwell has 48)
 #define PT 7
 
 typedef struct {
@@ -104,6 +105,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
+    bool uses_shared;  // LDS / STS: the workgroup's shared memory (compute)
     bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane, uses_point_coord;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
@@ -1960,6 +1962,39 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
         }
         sp(&c->body, "    }\n");
+    } else if (OPM(0xef48000000000000ull, 0xfff8000000000000ull) || OPM(0xef58000000000000ull, 0xfff8000000000000ull)) {  // LDS / STS
+        // the workgroup's shared memory (compute), a word array as local memory is (ACNH's compute shaders: one failed
+        // to translate on STS, its dispatches never ran)
+        if (c->stage != STAGE_COMPUTE) { fail(c, "shared memory outside compute"); return; }
+        bool store = bits(w, 52, 1);
+        int size = (int)bits(w, 48, 3);
+        int32_t off = (int32_t)sbits(w, 20, 24);
+        c->uses_shared = true;
+        char addr[128];
+        if (a == RZ) sprintf(addr, "%du", off);
+        else sprintf(addr, "(%s + %du)", R(a), (uint32_t)off);
+        int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
+        sp(&c->body, "    { uint sa = %s;\n", addr);
+        if (!store) {
+            if (size < 4) {
+                static const char *const ext[] = {"(v >> sh) & 0xFFu", "uint(int(char((v >> sh) & 0xFFu)))", "(v >> sh) & 0xFFFFu",
+                                                  "uint(int(short((v >> sh) & 0xFFFFu)))"};
+                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = smem[(sa >> 2) & %du]; uint sh = (sa & 3u) * 8u; r%d = %s;\n", SMEM_WORDS - 1, d, ext[size]); }
+            } else {
+                for (int k = 0; k < nw; k++)
+                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = smem[((sa >> 2) + %du) & %du];\n", d + k, k, SMEM_WORDS - 1); }
+            }
+        } else {
+            if (size < 4) {  // (a read-modify-write of the word: fine unless two lanes store bytes of one word at once)
+                uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
+                sp(&c->body, "      uint sh = (sa & 3u) * 8u; uint i = (sa >> 2) & %du; smem[i] = (smem[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
+                   SMEM_WORDS - 1, m, R(d), m);
+            } else {
+                for (int k = 0; k < nw; k++)
+                    sp(&c->body, "      smem[((sa >> 2) + %du) & %du] = %s;\n", k, SMEM_WORDS - 1, R(d == RZ ? RZ : d + k));
+            }
+        }
+        sp(&c->body, "    }\n");
     } else if (OPM(0xef10000000000000ull, 0xfff8000000000000ull)) {  // SHFL
         int mode = (int)bits(w, 30, 2);
         char bb[32];
@@ -2404,6 +2439,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (glsl_early_tests(c)) sp(&s, "layout(early_fragment_tests) in;\n");
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
+        if (c->uses_shared) sp(&s, "shared uint smem[%d];\n", SMEM_WORDS);
     }
     sp(&s, "void main() {\n");
     if (stage == STAGE_VERTEX) {
@@ -2723,6 +2759,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
+    if (c->uses_shared) sp(&s, "  threadgroup uint smem[%d];\n", SMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");

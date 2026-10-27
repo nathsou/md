@@ -1976,8 +1976,11 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 5, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCubeArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else {
             static int nlog;
-            if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
-                                 (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format, (unsigned long)tex.arrayLength);
+            if (nlog++ < 30)
+                LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu; program vs %llx fs %llx)\n",
+                    (unsigned long)want, (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format,
+                    (unsigned long)tex.arrayLength, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+                    st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
             return dummy_texture(want_type);
         }
     }
