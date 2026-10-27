@@ -365,7 +365,10 @@ Engine fixes it needed, all shared:
 - **Dark sea**: the sky panorama the water reflects samples `agl::env::CubeMap`, a cube array, as a cube: views now.
 - **Compute shared memory** (`LDS` / `STS`): a lighting kernel never translated.
 - Draws into targets not drawn the frame before (one-shot renders) wait for their shaders instead of being skipped.
-- Known, not done: audio renderer effects 2 (Aux), 3 (Delay), 5 (I3DL2 reverb), 6 (Biquad) pass audio through dry;
+- Audio renderer effects ported from Ryujinx: I3DL2 reverb (5: rooms, ACNH and Dread), delay (3), biquad filter (6).
+  Its Cos / Sin take degrees and its Pow10 clamps (radians made the reverb's feedback network diverge: NaN after
+  ~50 s of Dread); a non-finite state resets the effect. Aux (2) still passes audio through.
+- Known, not done:
   an 8x8x8 3D texture left bound to a 2D slot of a UI shader reads the dummy (undefined on the Switch too).
 - Testing aids: `LARECOMP_HIDDEN=1 LARECOMP_DISPLAY_SYNC=0 LARECOMP_UNCAPPED=1` runs the intro at 120 fps off screen;
   `LARECOMP_LIVE=<dir>` steers a running game (lines appended to `<dir>/cmd`: `A 6`, `STICK_UP 300`, `wait 60`,
