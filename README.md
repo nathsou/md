@@ -128,7 +128,9 @@ the keyboard:
 | Stick clicks | F / keypad 0 |
 | Right stick | Keypad 8 / 5 / 4 / 6 |
 
-Rebind in `nx.ini` (`bind_key_*` / `bind_pad_*` lines). F11 toggles fullscreen. A controller SDL doesn't know can be
+Typing: where a game asks for text with its own on-screen keyboard (the name in Animal Crossing's intro, its chat),
+type it on the keyboard; letters, digits, space, punctuation and Backspace go to the text while it's open (Enter
+confirms). Rebind in `nx.ini` (`bind_key_*` / `bind_pad_*` lines). F11 toggles fullscreen. A controller SDL doesn't know can be
 added with a mapping line in `gamecontrollerdb.txt` ([SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)).
 
 ## Shaders
