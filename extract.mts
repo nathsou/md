@@ -377,9 +377,19 @@ if (magic === "PFS0") {
   const secure = parsePartitionFs(sub(readRaw, rootOffset), "HFS0").find((e) => e.name === "secure");
   if (!secure) throw new Error("XCI has no secure partition");
   const secureRead = sub(readRaw, rootOffset + secure.offset);
-  ncas = parsePartitionFs(secureRead, "HFS0")
-    .filter((e) => e.name.endsWith(".nca"))
-    .map((e) => openNca(sub(secureRead, e.offset), e.name, e.size));
+  const entries = parsePartitionFs(secureRead, "HFS0").filter((e) => e.name.endsWith(".nca"));
+  // (the card header's last valid page, at 0x118: a dump shorter than that is cut short)
+  const need = base + (readRaw(base + 0x118, 4).readUInt32LE(0) + 1) * 0x200, have = statSync(xciPath).size;
+  if (have < need) {
+    const at = (e: Entry) => rootOffset + secure.offset + e.offset;
+    const lines = entries.map((e) => {
+      const got = Math.max(0, Math.min(e.size, have - at(e)));
+      return `  ${e.name}  ${(e.size / 2 ** 20).toFixed(1)} MiB: ${got === e.size ? "complete" : `${(got / 2 ** 20).toFixed(1)} MiB present`}`;
+    });
+    throw new Error(`${xciPath} is truncated: ${have} bytes of the ${need} its card header lists (an incomplete ` +
+                    `download or copy?)\n${lines.join("\n")}`);
+  }
+  ncas = entries.map((e) => openNca(sub(secureRead, e.offset), e.name, e.size));
   console.log("Secure partition NCAs:");
 }
 for (const n of ncas) console.log(`  ${n.name}  ${n.contentType.padEnd(10)} ${(n.size / 2 ** 20).toFixed(1)} MiB`);
