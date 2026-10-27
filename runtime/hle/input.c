@@ -934,6 +934,16 @@ HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     c->x[0] = id == 0 ? 1 : 0;  // docked: no handheld controller
 }
 
+// GetNpadControllerColor(left, right, id): the Joy-Con body / button colours. Our controller has none in shared
+// memory (the SDK aborts on its unset attribute), so both report a Pro Controller's: dark grey body, light buttons.
+// Animal Crossing asks once a save is loaded.
+HLE_FUNC("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", hid_controller_color) {
+    static const uint8_t color[8] = {0x2d, 0x2d, 0x2d, 0xff, 0xe6, 0xe6, 0xe6, 0xff};  // {main, sub} RGBA
+    memcpy((void *)(uintptr_t)c->x[0], color, 8);
+    memcpy((void *)(uintptr_t)c->x[1], color, 8);
+    c->x[0] = 0;
+}
+
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
 // controller connected.
 #include "../kernel.h"
