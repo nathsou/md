@@ -1598,6 +1598,13 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             if (*next == ',') next++;
         }
     }
+    {   // LARECOMP_LIVE (tests, runtime/hle/input.c): a "shot <name>" line saves this frame's game image as <dir>/<name>.png
+        extern char g_live_shot[1100];
+        if (g_live_shot[0] && b && b->tex) {
+            save_png(b->tex, g_live_shot);
+            g_live_shot[0] = 0;
+        }
+    }
     static long shot_from = -1;  // LARECOMP_SCREENSHOT_FROM=<frame>: periodic shots start there (into build/frames/)
     if (shot_from < 0) { const char *e = getenv("LARECOMP_SCREENSHOT_FROM"); shot_from = e ? atol(e) : 0; }
     if (shot_every && b && b->tex && frame % shot_every == 0 && (long)frame >= shot_from) {

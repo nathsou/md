@@ -657,6 +657,52 @@ static void host_test_frame(uint64_t frame) {
     }
 }
 
+// LARECOMP_LIVE=<dir> (tests): steering a running game. Lines appended to <dir>/cmd are read as they arrive:
+// "<BUTTON or STICK_*> <frames>" holds it from the next frame on (LARECOMP_INPUT's names), "wait <frames>" delays the
+// lines after it, "shot <name>" saves the next game image as <dir>/<name>.png; <dir>/frame gets the current frame.
+// The holds join LARECOMP_INPUT's script (same syntax inside), so the two can be combined.
+static char live_script[65536];
+static bool live_on;
+char g_live_shot[1100];
+static void live_frame(uint64_t frame) {
+    static const char *dir;
+    static int init;
+    static long off;
+    static uint64_t at;  // (the frame the next line starts at: "wait" moves it)
+    if (!init) { init = 1; dir = getenv("LARECOMP_LIVE"); live_on = dir && *dir; }
+    if (!live_on) return;
+    char path[1100];
+    if (frame % 30 == 0) {
+        snprintf(path, sizeof path, "%s/frame", dir);
+        FILE *ff = fopen(path, "w");
+        if (ff) { fprintf(ff, "%llu\n", (unsigned long long)frame); fclose(ff); }
+    }
+    snprintf(path, sizeof path, "%s/cmd", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    fseek(f, off, SEEK_SET);
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n')) break;  // (a line still being written: read it next frame)
+        off = ftell(f);
+        if (at < frame + 1) at = frame + 1;
+        char name[64] = "";
+        unsigned long n = 0;
+        if (sscanf(line, "%63s %lu", name, &n) < 1) continue;
+        if (!strcmp(name, "wait")) { at += n; continue; }
+        if (!strcmp(name, "shot")) {
+            char nm[64] = "";
+            if (sscanf(line, "%*s %63s", nm) == 1) snprintf(g_live_shot, sizeof g_live_shot, "%s/%s.png", dir, nm);
+            continue;
+        }
+        size_t l = strlen(live_script);
+        if (l + 64 < sizeof live_script)
+            snprintf(live_script + l, sizeof live_script - l, "%s%llu:%s:%lu", l ? "," : "", (unsigned long long)at, name, n ? n : 6);
+        LOG("[input] live: %s for %lu frames at frame %llu\n", name, n ? n : 6, (unsigned long long)at);
+    }
+    fclose(f);
+}
+
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip the opening on rando seeds)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
@@ -680,13 +726,14 @@ void input_frame(uint64_t frame) {
     host_test_frame(frame);
     vpad_frame(frame);
     const char *spec = getenv("LARECOMP_INPUT");
-    if (!spec) return;
+    live_frame(frame);
+    if (!spec && !live_on) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
                                         "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-    static char buf[16384];  // (long scripted sessions: the perf walk is ~4 KB)
-    snprintf(buf, sizeof buf, "%s", spec);
+    static char buf[16384 + sizeof live_script];  // (long scripted sessions: the perf walk is ~4 KB)
+    snprintf(buf, sizeof buf, "%s%s%s", spec ? spec : "", spec && live_script[0] ? "," : "", live_script);
     for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
         unsigned long start = 0, len = 10;
         char name[32] = "";

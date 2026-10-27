@@ -355,6 +355,22 @@ Engine fixes it needed, all shared:
   outside its lock (4 s stalls).
 - Time: `IStaticService` 400/401 (clock snapshots), `LARECOMP_TIME_OFFSET`.
 
+### ACNH fixes after the first play (PR acnh-fixes)
+- **Speed**: ACNH runs at 30 fps (window present interval 2) and steps per frame; presents now wait their 60 Hz
+  vsync slots unless the game opts out (`GAME_UNCAPPED_FPS`: Dread). Measured: a steady 30 fps, 34-35 ms frames.
+- **Black bands** over the blurred distance (depth of field) and blocky airport-wall shadows: a pass mixed a scaled
+  colour target with an unflagged R8 one, and Metal draws only over the smallest attachment; such textures are
+  promoted to scaled (metal.m `renderer_texture_promote_scalable`).
+- **Island flag / designs scrambled**: `LINEAR_RENDER_TARGET` (0x40) textures are pitch-linear, rows packed.
+- **Dark sea**: the sky panorama the water reflects samples `agl::env::CubeMap`, a cube array, as a cube: views now.
+- **Compute shared memory** (`LDS` / `STS`): a lighting kernel never translated.
+- Draws into targets not drawn the frame before (one-shot renders) wait for their shaders instead of being skipped.
+- Known, not done: audio renderer effects 2 (Aux), 3 (Delay), 5 (I3DL2 reverb), 6 (Biquad) pass audio through dry;
+  an 8x8x8 3D texture left bound to a 2D slot of a UI shader reads the dummy (undefined on the Switch too).
+- Testing aids: `LARECOMP_HIDDEN=1 LARECOMP_DISPLAY_SYNC=0 LARECOMP_UNCAPPED=1` runs the intro at 120 fps off screen;
+  `LARECOMP_LIVE=<dir>` steers a running game (lines appended to `<dir>/cmd`: `A 6`, `STICK_UP 300`, `wait 60`,
+  `shot name`). ACNH's island differs per new game (its randomness is time-based too), so scripts can't navigate.
+
 ### Generator
 - Jump tables whose bounds check sits far above the `br` (compilers schedule the per-case register setup in between:
   29 instructions in ACNH 2.0.7) are found within `JT_WINDOW` (48) straight-line instructions instead of 16. Before,
